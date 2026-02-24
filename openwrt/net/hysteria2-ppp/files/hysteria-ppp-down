@@ -1,0 +1,23 @@
+#!/bin/sh
+# pppd ip-down for the pppd that netifd runs.
+#
+# Shuts the gate, so member links stop dialling into a bundle that is going away,
+# and then chains to netifd's own script.
+#
+# This is the tidy path only. pppd runs ip-down when it takes the bundle down
+# itself; killed outright it runs nothing, and the gate file is left behind --
+# which is why hysteria-ppp-link checks for the network device as well and does
+# not trust this file on its own.
+
+# Only when the BUNDLE is going, not when one address family is. pppd runs
+# ip-down on an IPCP-only termination too, and on a dual-stack session that
+# leaves the bundle, the device and IPV6CP all up -- shutting the gate there
+# would tear every member link off a perfectly healthy bundle. multilink.c
+# exports BUNDLE into the script environment, so it is visible in both hooks.
+# The /sys/class/net half of the members' gate check remains the backstop for a
+# holder killed outright, which never runs this at all.
+if [ -n "$HYSTERIA_GATE" ] && [ -n "$BUNDLE" ]; then
+	rm -f "$HYSTERIA_GATE"
+fi
+
+exec /lib/netifd/ppp-down "$@"

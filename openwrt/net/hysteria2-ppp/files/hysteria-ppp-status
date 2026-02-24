@@ -1,0 +1,151 @@
+#!/bin/sh
+# Which servers each Hysteria interface is connected to, as a table.
+#
+#   hysteria-ppp-status [interface ...]
+#
+# Same collector as the ubus object, so the two cannot come to different
+# conclusions about the same router -- which is the whole reason the collector is
+# a library and not a function inside either of them.
+#
+# Exit status is the worst state found, so this drops into a cron check without
+# anything having to parse it:
+#
+#   0  every configured server is carrying
+#   1  the interface is up but at least one server is not
+#   2  no interface is up, or none exists
+
+# Conditional for the same reason the library's own source line is: it lets the
+# suite point both formatters at a scratch directory without either of them
+# taking a path out of the environment.
+# shellcheck disable=SC1091  # installed alongside this file by the package
+command -v hysteria_status_json >/dev/null 2>&1 ||
+	. /usr/libexec/hysteria2-ppp-statuslib
+
+# Field of a flat JSON object, without a JSON parser. The collector emits every
+# value on one line and escapes what it emits, so this is reading back a format
+# this package controls end to end rather than parsing JSON in sed -- which is
+# why it is acceptable here and would not be anywhere else.
+field() {
+	printf '%s' "$1" | sed -n "s/.*\"$2\":\"\\([^\"]*\\)\".*/\\1/p"
+}
+
+number() {
+	printf '%s' "$1" | sed -n "s/.*\"$2\":\\([0-9-]*\\).*/\\1/p"
+}
+
+# Seconds as the coarse duration a human reads at a glance. Deliberately not
+# padded to a fixed width: a bundle that has been up for six days should not have
+# its uptime abbreviated to make room for the minutes.
+duration() {
+	local s="$1"
+	[ -n "$s" ] && [ "$s" -ge 0 ] 2>/dev/null || {
+		printf -- '-'
+		return
+	}
+	if [ "$s" -ge 86400 ]; then
+		printf '%dd %02dh' $((s / 86400)) $(((s % 86400) / 3600))
+	elif [ "$s" -ge 3600 ]; then
+		printf '%dh %02dm' $((s / 3600)) $(((s % 3600) / 60))
+	elif [ "$s" -ge 60 ]; then
+		printf '%dm %02ds' $((s / 60)) $((s % 60))
+	else
+		printf '%ds' "$s"
+	fi
+}
+
+state_text() {
+	case "$1" in
+	carrying) echo "in bundle" ;;
+	connected) echo "connected" ;;
+	dialling) echo "connecting" ;;
+	refused) echo "refused by bundle" ;;
+	retrying) echo "retrying" ;;
+	blocked) echo "stopped" ;;
+	*) echo "idle" ;;
+	esac
+}
+
+bundle_text() {
+	case "$1" in
+	formed) echo "bundle formed" ;;
+	refused) echo "single link, peer refused multilink" ;;
+	off) echo "single link" ;;
+	*) echo "down" ;;
+	esac
+}
+
+rc=2
+
+names="$*"
+[ -n "$names" ] || names=$(hysteria_status_interfaces)
+[ -n "$names" ] || {
+	echo "no hysteria interface is configured" >&2
+	exit 2
+}
+
+for name in $names; do
+	doc=$(hysteria_status_json "$name") || {
+		echo "$name: not set up" >&2
+		continue
+	}
+
+	device=$(field "$doc" device)
+	bundle_state=$(field "$doc" bundle_state)
+	configured=$(number "$doc" links_configured)
+	up=$(number "$doc" links_up)
+	mtu=$(number "$doc" mtu)
+	ignored=$(number "$doc" servers_ignored)
+	spare=$(number "$doc" supervisors_spare)
+
+	printf '%-6s %-9s %-38s %s/%s links   mtu %s\n' \
+		"$name" "$device" "$(bundle_text "$bundle_state")" \
+		"$up" "$configured" "$mtu"
+
+	case "$doc" in
+	*'"up":true'*)
+		if [ "$up" = "$configured" ]; then
+			[ "$rc" -le 0 ] || rc=0
+		else
+			rc=1
+		fi
+		;;
+	esac
+
+	printf '  %-2s %-30s %-7s %-18s %-10s %s\n' \
+		'#' 'server' 'role' 'state' 'for' 'last event'
+
+	# One line per link. Splitting the array on "},{" rather than parsing it: the
+	# collector writes both, and nothing in a value can contain that sequence,
+	# every value being escaped before it goes in.
+	links=${doc#*'"links":['}
+	links=${links%']}'}
+	OLDIFS=$IFS
+	IFS='
+'
+	for link in $(printf '%s' "$links" | sed -e 's/},{/}\n{/g'); do
+		[ -n "$link" ] || continue
+		slot=$(number "$link" slot)
+		server=$(field "$link" server)
+		role=$(field "$link" role)
+		state=$(field "$link" state)
+		since=$(number "$link" for)
+		errcode=$(field "$link" code)
+		errago=$(number "$link" ago)
+
+		note='-'
+		[ -n "$errcode" ] && note="$errcode, $(duration "$errago") ago"
+
+		printf '  %-2s %-30s %-7s %-18s %-10s %s\n' \
+			"$slot" "${server:--}" "${role:--}" \
+			"$(state_text "$state")" "$(duration "$since")" "$note"
+	done
+	IFS=$OLDIFS
+
+	[ "${spare:-0}" -gt 0 ] 2>/dev/null &&
+		printf '  %s supervisor(s) spare, by design\n' "$spare"
+	[ "${ignored:-0}" -gt 0 ] 2>/dev/null &&
+		printf '  %s additional server(s) configured but multilink is disabled\n' "$ignored"
+	echo
+done
+
+exit "$rc"

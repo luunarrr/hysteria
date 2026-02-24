@@ -1,0 +1,352 @@
+#!/bin/sh
+# Reads back what the dialers wrote and says which servers an interface is
+# actually connected to. Sourced by the rpcd plugin and by hysteria-ppp-status;
+# never executed on its own.
+#
+# One collector with two formatters, rather than a formatter each, because the
+# two would otherwise drift: the page and the command line would disagree about a
+# degraded bundle and there would be no way to tell which was right.
+#
+# It reads only files, takes no locks, and changes nothing. That matters more
+# than it sounds: this runs from rpcd on behalf of a web session, several times a
+# minute, while the pool it is describing is being claimed and released
+# underneath it. Anything it held or wrote would be a new way for a status page
+# to break a working bundle.
+#
+# Kept out of hysteria2-ppp-common on purpose. netifd sources that file at
+# startup for every interface it sets up, and none of this belongs on the path
+# that brings a link up.
+
+# Conditional so the test suite can source the common file from the source tree
+# first and have this one use it. Written as "is the function there" rather than
+# as an overridable path, because this runs as root out of rpcd and a source
+# whose location comes from the environment is not something to ship.
+# shellcheck disable=SC1091  # installed alongside this file by the package
+command -v hysteria_meta_file >/dev/null 2>&1 ||
+	. /usr/libexec/hysteria2-ppp-common
+
+# The two facts that come from outside the package's own files, as functions so
+# that tests/status.sh can drive them. Overriding a function is how
+# tests/claim-pool.sh already redirects the pool, and it keeps the shipped code
+# free of an environment variable that redirects where a root process reads.
+hysteria_status_run_dir() { echo /var/run; }
+
+# Whether an interface's device exists right now. The gate file says a bundle was
+# created; this says it still exists, and the pair is what the members' own gate
+# check has always used -- a holder killed outright never runs ip-down, so the
+# file outlives the bundle and nothing else would notice.
+hysteria_status_device_up() {
+	[ -n "$1" ] && [ -d "/sys/class/net/$1" ]
+}
+
+# The same ceiling hysteria.sh bounds its own sweep with. It bounds the slot loop
+# below for the same reason: the meta file is written by a previous run of a
+# script that may since have been replaced, so its slot count is input, not fact.
+HYSTERIA_STATUS_MAX_LINKS=16
+
+# How long a recorded failure stays the current explanation for a server that is
+# not carrying. Past this it is history: a link that has been down for an hour is
+# down for whatever reason it is down for now, not for the one it first failed
+# with.
+HYSTERIA_STATUS_ERR_TTL=900
+
+# hysteria_json_escape makes one value safe to place between double quotes.
+#
+# Not decorative. Server addresses are free-form operator strings that nothing
+# validates -- the same class of value that already needs careful quoting for
+# YAML, for pppd's option parser and for a file that gets sourced -- and an LNS
+# disconnect message is a string chosen by the far end. A quote or a backslash in
+# either produces a document that no parser accepts, which does not corrupt one
+# field but blanks the entire page, for every interface, including the ones that
+# are fine.
+#
+# The bracket expression handles both characters in one pass, matching ppp_quote.
+# Tabs become spaces because JSON forbids a raw control character in a string;
+# newlines cannot arrive at all, the files being read a line at a time.
+hysteria_json_escape() {
+	printf '%s' "$1" | sed -e 's/[\\"]/\\&/g' -e 's/	/ /g'
+}
+
+# hysteria_status_valid_name gates every interface name that reaches a path.
+#
+# The name arrives from an untrusted caller -- rpcd hands over whatever the ubus
+# request contained -- and is concatenated into /var/run/hysteria-$1.meta and a
+# dozen siblings. Without this, "../../etc/shadow" is a readable path, and while
+# the collector only ever extracts named fields, it prints the values it finds.
+# Checked once, at the entry point, rather than at each of the twenty places a
+# name is joined to a path.
+hysteria_status_valid_name() {
+	case "$1" in
+	"" | *[!A-Za-z0-9_]*) return 1 ;;
+	esac
+	return 0
+}
+
+# hysteria_status_interfaces lists the interfaces that have been set up, one per
+# line. The meta file is the marker because it is written last by setup and
+# removed first by teardown, so its presence brackets the period in which any of
+# the rest exists.
+hysteria_status_interfaces() {
+	local file name
+
+	local dir
+	dir=$(hysteria_status_run_dir)
+
+	for file in "$dir"/hysteria-*.meta; do
+		[ -f "$file" ] || continue
+		name=${file#"$dir"/hysteria-}
+		name=${name%.meta}
+		hysteria_status_valid_name "$name" || continue
+		echo "$name"
+	done
+}
+
+# _hysteria_read_kv loads one key=value file into shell variables named by a
+# prefix. Read rather than sourced, and this is not a stylistic preference: the
+# detail field carries text the LNS chose, and "." would execute it.
+_hysteria_read_kv() {
+	local file="$1" prefix="$2"
+	local key value
+
+	[ -r "$file" ] || return 1
+	while IFS='=' read -r key value; do
+		case "$key" in
+		"" | *[!a-z_]*) continue ;;
+		esac
+		eval "$prefix$key=\$value"
+	done < "$file"
+	return 0
+}
+
+# hysteria_status_json prints one interface as a JSON object, or fails when there
+# is no such interface.
+#
+# Everything it can say is derived here rather than in either formatter, so that
+# the page and the command line cannot come to different conclusions about the
+# same router.
+hysteria_status_json() {
+	local config="$1"
+	local meta_ifname="" meta_multilink=0 meta_slots=1 meta_mtu=""
+	local meta_bundle_mtu="" meta_bundle="" meta_endpoint="" meta_servers_ignored=0
+	local now claimsdir gate device_up bundle_state
+	local n links links_up members sup live spare pidfile supervisor
+	local server claim held age
+	local st_pid st_role st_state st_since st_joined st_join_by
+	local cl_state cl_reason cl_detail
+	local er_code er_at er_detail
+	local joined join_by state entry
+
+	hysteria_status_valid_name "$config" || return 1
+	_hysteria_read_kv "$(hysteria_meta_file "$config")" meta_ || return 1
+
+	# The slot count decides how many times the loop below stats the filesystem,
+	# and it comes out of a file. Bounded and forced to a number.
+	case "$meta_slots" in
+	"" | *[!0-9]*) meta_slots=1 ;;
+	esac
+	[ "$meta_slots" -ge 1 ] || meta_slots=1
+	[ "$meta_slots" -le "$HYSTERIA_STATUS_MAX_LINKS" ] || meta_slots=$HYSTERIA_STATUS_MAX_LINKS
+	case "$meta_servers_ignored" in
+	"" | *[!0-9]*) meta_servers_ignored=0 ;;
+	esac
+
+	now=$(hysteria_uptime)
+	claimsdir=$(hysteria_claims_dir "$config")
+
+	# Two facts, not one, exactly as the members' own gate check has always used
+	# them: the file says a bundle was created, the device says it is still there.
+	# A holder killed outright never runs ip-down, so the file alone would report a
+	# bundle that has been gone for hours.
+	device_up=0
+	hysteria_status_device_up "$meta_ifname" && device_up=1
+	gate=0
+	[ "$device_up" = 1 ] && [ -f "$(hysteria_gate_file "$config")" ] && gate=1
+
+	if [ "$meta_multilink" != 1 ]; then
+		bundle_state=off
+	elif [ "$device_up" = 0 ]; then
+		bundle_state=down
+	elif [ "$gate" = 1 ]; then
+		bundle_state=formed
+	else
+		# The interface is up and will work, at one link. This is the case that
+		# looks like success from every other status display on the router.
+		bundle_state=refused
+	fi
+
+	links=""
+	links_up=0
+	members=0
+	n=1
+	while [ "$n" -le "$meta_slots" ]; do
+		server=$(hysteria_server_of "$config" "$n")
+
+		claim=$(readlink "$claimsdir/$n" 2>/dev/null)
+		held=0
+		[ -n "$claim" ] && kill -0 "$claim" 2>/dev/null && held=1
+
+		st_pid="" st_role="" st_state="" st_since="" st_joined="" st_join_by=""
+		cl_state="" cl_reason="" cl_detail=""
+		er_code="" er_at="" er_detail=""
+		_hysteria_read_kv "$(hysteria_slot_state "$config" "$n")" st_
+		_hysteria_read_kv "$(hysteria_slot_client "$config" "$n")" cl_
+		_hysteria_read_kv "$(hysteria_slot_lasterr "$config" "$n")" er_
+
+		# Staleness, and the only check that makes any of the rest trustworthy.
+		#
+		# A state file describes one attempt by one process. Its writer does clear
+		# it, but not on the path that matters: once pppd has exited the claim names
+		# a pid that answers nothing, and clearing it is the reaper's job rather than
+		# the dying supervisor's. So the reader has to be able to tell a live record
+		# from the remains of the previous one, and the claim is what tells it --
+		# either because nothing holds the slot at all, or because what holds it is
+		# not what wrote the file.
+		#
+		# Skipped entirely without multilink: there is no pool, no claim, and no
+		# supervisor on that path, so there is nothing to disagree with.
+		if [ "$meta_multilink" = 1 ]; then
+			if [ "$held" = 0 ] || { [ -n "$st_pid" ] && [ "$st_pid" != "$claim" ]; }; then
+				st_pid="" st_role="" st_state="" st_since="" st_joined="" st_join_by=""
+				cl_state="" cl_reason="" cl_detail=""
+			fi
+		fi
+
+		joined="$st_joined"
+		join_by="$st_join_by"
+		# The holder's join is not read from a pppd log, because netifd owns that
+		# pppd's stdout and this package never sees it. It does not need to: the
+		# gate file is written from the holder's own ip-up, out of the BUNDLE
+		# variable pppd exports only where it created or joined a bundle. That is
+		# the same fact, from the process that had it first.
+		if [ "$st_role" = holder ] && [ "$gate" = 1 ]; then
+			joined=1
+			join_by=bundle-created
+		fi
+
+		state=idle
+		if [ "$cl_state" = up ]; then
+			case "$joined" in
+			1) state=carrying ;;
+			0) state=refused ;;
+			# Connected, and not promoted to carrying. A pppd whose wording the
+			# supervisor did not recognise leaves the verdict open forever, and the
+			# honest report of an open verdict is that the transport is up and the
+			# bundle membership is unknown.
+			*) state=connected ;;
+			esac
+		elif [ "$st_state" = refused ]; then
+			state=refused
+		elif [ -n "$st_state" ]; then
+			state=dialling
+		elif [ "$meta_multilink" != 1 ] && [ "$device_up" = 1 ]; then
+			# Single server: no pool, no supervisor, nothing that writes a state file,
+			# so a client too old to write one leaves the device as the only evidence.
+			# Reported as connected, never as carrying -- there is no bundle here for
+			# anything to be carried into.
+			state=connected
+		fi
+
+		# A server that failed recently and is not carrying now is retrying,
+		# whoever happens to be dialling it. The pool's own distinction -- that the
+		# supervisor which failed is not the one that redials, and that its backoff
+		# says nothing about when the next attempt lands -- is real and is not the
+		# operator's question. What they asked is whether this server is working.
+		age=""
+		if [ -n "$er_code" ] && [ -n "$er_at" ] && [ -n "$now" ]; then
+			age=$((now - er_at))
+			[ "$age" -ge 0 ] || age=0
+			[ "$age" -le "$HYSTERIA_STATUS_ERR_TTL" ] || er_code=""
+		fi
+		if [ -n "$er_code" ]; then
+			case "$state" in
+			carrying | connected) ;;
+			*)
+				case "$er_code" in
+				# The two that waiting cannot fix. netifd has already stopped
+				# redialling on these, so "retrying" would be a plain untruth.
+				AUTH_FAILED | NO_ROUTE) state=blocked ;;
+				*) state=retrying ;;
+				esac
+				;;
+			esac
+		fi
+
+		case "$state" in
+		carrying | connected) links_up=$((links_up + 1)) ;;
+		esac
+		[ "$st_role" = member ] && [ "$held" = 1 ] && members=$((members + 1))
+
+		entry="{\"slot\":$n"
+		[ -n "$server" ] && entry="$entry,\"server\":\"$(hysteria_json_escape "$server")\""
+		[ -n "$st_role" ] && entry="$entry,\"role\":\"$st_role\""
+		entry="$entry,\"state\":\"$state\""
+		[ "$held" = 1 ] && entry="$entry,\"pid\":$claim"
+		if [ -n "$st_since" ] && [ -n "$now" ]; then
+			entry="$entry,\"for\":$((now - st_since))"
+		fi
+		case "$joined" in
+		1) entry="$entry,\"joined\":true" ;;
+		0) entry="$entry,\"joined\":false" ;;
+		esac
+		[ -n "$join_by" ] && entry="$entry,\"joined_by\":\"$join_by\""
+		if [ -n "$er_code" ]; then
+			entry="$entry,\"last_error\":{\"code\":\"$(hysteria_json_escape "$er_code")\""
+			[ -n "$age" ] && entry="$entry,\"ago\":$age"
+			[ -n "$er_detail" ] && entry="$entry,\"detail\":\"$(hysteria_json_escape "$er_detail")\""
+			entry="$entry}"
+		fi
+		entry="$entry}"
+
+		[ -n "$links" ] && links="$links,"
+		links="$links$entry"
+		n=$((n + 1))
+	done
+
+	# Supervisors that are alive but hold no slot. With N servers and N
+	# supervisors plus the pppd netifd runs, exactly one is always over, and
+	# saying so is the difference between a design working as intended and an
+	# operator counting dialling links and coming up one short. Only meaningful
+	# once a bundle exists: before that they are all waiting, not spare.
+	live=0
+	sup=1
+	while [ "$sup" -le "$meta_slots" ]; do
+		pidfile=$(hysteria_sup_pid "$config" "$sup")
+		if [ -r "$pidfile" ]; then
+			read -r supervisor < "$pidfile"
+			[ -n "$supervisor" ] && kill -0 "$supervisor" 2>/dev/null &&
+				live=$((live + 1))
+		fi
+		sup=$((sup + 1))
+	done
+	spare=$((live - members))
+	[ "$spare" -ge 0 ] || spare=0
+	[ "$gate" = 1 ] || spare=0
+
+	printf '{"interface":"%s"' "$(hysteria_json_escape "$config")"
+	[ -n "$meta_ifname" ] && printf ',"device":"%s"' "$(hysteria_json_escape "$meta_ifname")"
+	printf ',"up":%s' "$([ "$device_up" = 1 ] && echo true || echo false)"
+	printf ',"multilink":%s' "$([ "$meta_multilink" = 1 ] && echo true || echo false)"
+	printf ',"bundle_state":"%s"' "$bundle_state"
+	[ -n "$meta_bundle" ] && printf ',"bundle":"%s"' "$(hysteria_json_escape "$meta_bundle")"
+	[ -n "$meta_endpoint" ] && printf ',"endpoint":"%s"' "$(hysteria_json_escape "$meta_endpoint")"
+	[ -n "$meta_bundle_mtu" ] && printf ',"mtu":%s' "$meta_bundle_mtu"
+	[ -z "$meta_bundle_mtu" ] && [ -n "$meta_mtu" ] && printf ',"mtu":%s' "$meta_mtu"
+	printf ',"links_configured":%s,"links_up":%s' "$meta_slots" "$links_up"
+	printf ',"servers_ignored":%s' "$meta_servers_ignored"
+	printf ',"supervisors_spare":%s' "$spare"
+	printf ',"links":[%s]}' "$links"
+}
+
+# hysteria_status_all_json wraps every interface in one document, so a caller
+# polling a router with two bundles makes one request rather than three.
+hysteria_status_all_json() {
+	local name first=1
+
+	printf '{"interfaces":['
+	for name in $(hysteria_status_interfaces); do
+		[ "$first" = 1 ] || printf ','
+		first=0
+		hysteria_status_json "$name" || printf 'null'
+	done
+	printf ']}'
+}
