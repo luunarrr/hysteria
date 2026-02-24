@@ -1,0 +1,71 @@
+#!/bin/sh
+# pppd ip-up for the pppd that netifd runs, which is the one holding the bundle.
+#
+# Two jobs, then it chains to netifd's own script. Both settle things that are
+# only knowable from inside pppd's ip-up environment.
+#
+# pppd calls this as:  ip-up <iface> <tty> <speed> <local-ip> <remote-ip> <ipparam>
+
+IFNAME="$1"
+
+# 1. Open the gate for the member links.
+#
+# The question a member has to answer before it dials is not "is the holder
+# running" but "did a bundle get created" -- and those differ in the case that
+# matters. If the far end refused MRRU the link comes up as an ordinary single
+# PPP session, and a member joining it would not join anything: it would open a
+# second, independent session to the LNS under the same subscriber name, which
+# most LNS resolve by dropping the first. The working link dies to make room for
+# the one that was meant to widen it.
+#
+# pppd exports BUNDLE only on the path where it created or joined a bundle, so
+# its presence here is exactly the fact the members need, with nothing to parse
+# and nothing to race against.
+if [ -n "$BUNDLE" ] && [ -n "$HYSTERIA_GATE" ]; then
+	printf '%s\n' "$BUNDLE" > "$HYSTERIA_GATE"
+elif [ -n "$HYSTERIA_GATE" ]; then
+	# Reachable, and worth saying out loud: the interface is about to come up and
+	# work, just at one link. Without this line the only evidence is that the
+	# extra servers never appear in the link count.
+	logger -t hysteria -p daemon.warn \
+		"$IFNAME: peer did not accept Multilink PPP, additional servers stay idle"
+	rm -f "$HYSTERIA_GATE"
+fi
+
+# 2. Pin the bundle MTU.
+#
+# pppd sizes the bundle device from MIN(peer MRRU, our MRU), and the peer is free
+# to advertise 1500 or more -- what the far end can reassemble says nothing about
+# what a QUIC datagram carries. The mtu option passed alongside covers this in
+# the ordinary case; the pin is here for the case where the peer's MRRU lands
+# below it, and because getting it wrong is silent. Left too large, a full-size
+# packet becomes one oversized fragment whenever the bundle is down to a single
+# link, and the transport drops it -- every full-size packet, only in the
+# degraded state, which reads as "the backup path does not work".
+if [ -n "$HYSTERIA_BUNDLE_MTU" ] && [ -n "$IFNAME" ]; then
+	# Clamp downward only.
+	#
+	# pppd already sizes the bundle device as MIN(peer MRRU, our MRU), and "our
+	# MRU" is the mtu option the handler passed -- the same number as this one. So
+	# pppd's value is always <= this, and an unconditional assignment could only
+	# ever RAISE it, putting reassembled units above the MRRU the peer advertised,
+	# which the peer then discards. That is a silent full-size-packet loss that
+	# survives every reconnect, and it is what an LNS with a lowered "ppp multilink
+	# mrru local" would trigger. Kept as a clamp so it stays correct if the option
+	# set changes; today it does nothing.
+	cur=$(cat "/sys/class/net/$IFNAME/mtu" 2>/dev/null)
+	if [ -n "$cur" ] && [ "$cur" -gt "$HYSTERIA_BUNDLE_MTU" ] 2>/dev/null; then
+		ip link set dev "$IFNAME" mtu "$HYSTERIA_BUNDLE_MTU" 2>/dev/null ||
+			logger -t hysteria -p daemon.warn \
+				"$IFNAME: could not lower bundle MTU to $HYSTERIA_BUNDLE_MTU"
+	fi
+fi
+
+# Which of netifd's scripts to chain to is decided by the hook pppd ran us from.
+# They are not interchangeable: ppp6-up adds the link-local /128 and creates the
+# <iface>_6 dhcpv6 interface, while ppp-up reads IPLOCAL/IPREMOTE, which an
+# ipv6-up invocation never sets.
+if [ -n "$LLLOCAL" ]; then
+	exec /lib/netifd/ppp6-up "$@"
+fi
+exec /lib/netifd/ppp-up "$@"

@@ -1,0 +1,173 @@
+#!/bin/sh
+# Shared by the two things that dial a link: hysteria-ppp-dial, which is the pty
+# command for the pppd netifd runs, and hysteria-ppp-link, which supervises the
+# rest. Sourced, never executed.
+#
+# What it provides is a claim pool over the configured servers. Every link is
+# identical -- there is no anchor, no "first" server, and no link whose loss
+# costs more than any other's -- and the pool is what makes that true: a dialer
+# takes whichever server is free rather than being assigned one.
+#
+# Why a pool rather than a fixed server per dialer. One pppd owns the network
+# device: it is the process that created the PPP unit, ppp->owner is set once at
+# creation and there is no ioctl to transfer it, so its death is necessarily a
+# full interface rebuild. That much is irreducible. What is not irreducible is
+# that pppd being tied to a particular server, and the pool is what unties it.
+# When its transport dies, its slot returns to the pool, the process stays alive
+# holding the bundle, and whichever supervisor is idle dials that server again as
+# an ordinary member link. Capacity comes back without the device ever going.
+
+# hysteria_claims_dir is the pool. One symlink per claimed slot, its target the
+# claimant's pid: symlink(2) is the claim, because it is atomic and publishes the
+# owner in the same step, so it needs no lock file, no flock, and no cleanup
+# beyond the unlink. Reaping a dead claim needs a lock of its own -- see
+# hysteria_claim_slot for why removal is not serialised by the symlink.
+hysteria_claims_dir() { echo "/var/run/hysteria-$1.claims"; }
+
+hysteria_slot_yaml()   { echo "/var/run/hysteria-$1-$2.yaml"; }
+hysteria_slot_status() { echo "/var/run/hysteria-$1-$2.status"; }
+
+# hysteria_holder_err is where the holder's client writes its stderr.
+#
+# A member's stderr is captured by its supervisor, which outlives its pppd and
+# replays it. The holder has no supervisor: its client is pppd's pty child and
+# dies with it, so the only thing that can read this back is the protocol
+# handler's own teardown -- which is why this is a file per interface rather
+# than per attempt, and why teardown removes it rather than the writer.
+hysteria_holder_err() { echo "/var/run/hysteria-$1.err"; }
+
+# hysteria_rotor_file remembers where the next scan should start.
+#
+# Deliberately not inside the claims directory: that is emptied at every setup,
+# and the case this exists for is exactly the one where setup runs again and
+# again. It is only a hint -- a lost or garbled write costs one repeated first
+# choice and nothing else.
+hysteria_rotor_file() { echo "/var/run/hysteria-$1.rotor"; }
+
+# hysteria_claim_slot claims a free slot in 1..count and echoes its number, or
+# fails when every slot is taken.
+#
+# A claim is a symlink whose target is the claimant's pid. symlink(2) fails with
+# EEXIST if the name is taken, so creating the claim and recording its owner are
+# a SINGLE atomic step. Doing it as mkdir-then-write-a-pid-file instead leaves a
+# window in which the claim exists with no owner, and a second claimant arriving
+# there reads no pid, calls the slot abandoned, and takes one that was just won.
+#
+# Reaping needs a second lock, and this is the part that is easy to get wrong.
+# The symlink serialises creation but NOT removal: two claimants that both read
+# the same dead pid interleave as rm(A), ln(A) wins, rm(B) deletes A's live
+# claim, ln(B) wins -- and both return the same slot, so two pppd dial one
+# concentrator under one account. The mkdir below picks exactly one reaper; the
+# losers move on rather than racing. Covered by tests/claim-pool.sh, which seeds
+# every slot with a dead owner precisely to exercise this path.
+#
+# The scan starts at a rotating offset. Without that the dialer -- the only
+# claimant that can run before a bundle exists, since every supervisor is gated
+# on one -- takes slot 1 every time, and a first server that is simply down
+# holds the interface at zero links while every other concentrator sits idle.
+# That would put the anchor back, just relocated from "the first pppd's server"
+# to "slot 1".
+#
+# Callers use it as "SLOT=$(hysteria_claim_slot ...)", which runs it in a
+# subshell -- and the pid it records is still the right one. POSIX specifies $$
+# as the process id of the *invoking* shell, not of the subshell evaluating the
+# substitution. Verified against dash and bash; ash follows the same rule.
+hysteria_claim_slot() {
+	local config="$1" count="$2"
+	local dir n holder rotor start i=0
+
+	dir=$(hysteria_claims_dir "$config")
+	mkdir -p "$dir" 2>/dev/null
+
+	rotor=$(hysteria_rotor_file "$config")
+	start=0
+	[ -r "$rotor" ] && read -r start < "$rotor" 2>/dev/null
+	case "$start" in "" | *[!0-9]*) start=0 ;; esac
+
+	while [ "$i" -lt "$count" ]; do
+		n=$(((start + i) % count + 1))
+		i=$((i + 1))
+
+		if ln -s "$$" "$dir/$n" 2>/dev/null; then
+			echo $((n % count)) > "$rotor" 2>/dev/null
+			echo "$n"
+			return 0
+		fi
+
+		holder=$(readlink "$dir/$n" 2>/dev/null)
+		if [ -z "$holder" ]; then
+			# Released between the attempt above and this read. Retry: for a free
+			# slot the symlink is all the serialisation needed.
+			if ln -s "$$" "$dir/$n" 2>/dev/null; then
+				echo $((n % count)) > "$rotor" 2>/dev/null
+				echo "$n"
+				return 0
+			fi
+		elif ! kill -0 "$holder" 2>/dev/null; then
+			if mkdir "$dir/$n.reap" 2>/dev/null; then
+				# Re-read under the lock: the owner may have been replaced between
+				# the test above and here.
+				holder=$(readlink "$dir/$n" 2>/dev/null)
+				if [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; then
+					rm -f "$dir/$n"
+					if ln -s "$$" "$dir/$n" 2>/dev/null; then
+						rmdir "$dir/$n.reap" 2>/dev/null
+						echo $((n % count)) > "$rotor" 2>/dev/null
+						echo "$n"
+						return 0
+					fi
+				fi
+				rmdir "$dir/$n.reap" 2>/dev/null
+			fi
+		fi
+	done
+	return 1
+}
+
+# hysteria_claim_retarget points a claim we already hold at another pid, so that
+# it names the process actually holding the server rather than the shell that
+# arranged for it.
+#
+# The supervisor needs this and the dialer does not. The dialer execs, which
+# keeps its pid, so its claim names the client all along. A supervisor stays a
+# separate process from the pppd it starts, and pppd 2.5.2 sets no
+# PR_SET_PDEATHSIG and never checks its parent -- so a supervisor killed outright
+# leaves an orphaned pppd whose channel is still in the bundle, on a claim that
+# now names a dead shell. The idle supervisor reaps it within seconds and dials a
+# second session to the same concentrator, with the same account and the same
+# endpoint discriminator.
+#
+# rename(2) is what makes the swap atomic. "ln -sfn" is not.
+hysteria_claim_retarget() {
+	local link tmp
+	link="$(hysteria_claims_dir "$1")/$2"
+	[ "$(readlink "$link" 2>/dev/null)" = "${HY_CLAIM_PID:-$$}" ] || return 1
+	tmp="$link.rt$$"
+	rm -f "$tmp"
+	ln -s "$3" "$tmp" 2>/dev/null || return 1
+	mv -f "$tmp" "$link" 2>/dev/null || {
+		rm -f "$tmp"
+		return 1
+	}
+	HY_CLAIM_PID="$3"
+	return 0
+}
+
+# hysteria_release_slot gives a slot back, but only if it is still ours: a slot
+# reaped from us while we were dying belongs to whoever reaped it.
+hysteria_release_slot() {
+	local config="$1" slot="$2"
+	local link
+
+	[ -n "$slot" ] || return 0
+	link="$(hysteria_claims_dir "$config")/$slot"
+	[ "$(readlink "$link" 2>/dev/null)" = "${HY_CLAIM_PID:-$$}" ] || return 0
+	rm -f "$link"
+	return 0
+}
+
+# hysteria_server_of echoes the server address a slot dials, read back from the
+# YAML the protocol handler wrote. Used for logging only.
+hysteria_server_of() {
+	sed -n "s/^server: //p" "$(hysteria_slot_yaml "$1" "$2")" 2>/dev/null | tr -d "'\""
+}
