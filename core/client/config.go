@@ -25,6 +25,7 @@ type Config struct {
 	QUICConfig      QUICConfig
 	BandwidthConfig BandwidthConfig
 	FastOpen        bool
+	PPPMode         bool // When true, skip UDP session manager; datagrams are reserved for PPP
 
 	filled bool // whether the fields have been verified and filled
 }
