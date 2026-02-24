@@ -1,0 +1,131 @@
+#!/bin/sh
+# The pty command for the pppd that netifd runs.
+#
+#   hysteria-ppp-dial <interface> <slot-count>
+#
+# Claims a server slot, then becomes the hysteria client for it. pppd speaks PPP
+# over this process's stdin and stdout, so the exec at the end is not an
+# optimisation -- the client has to inherit the pty directly, with nothing left
+# in between to copy bytes.
+#
+# This exists so that the pppd netifd watches is not tied to one server. It owns
+# the PPP unit, which cannot be transferred, but which server it happens to be
+# dialling is nobody's business but the pool's: if this transport dies, the slot
+# goes back, pppd stays alive holding the bundle, and a supervisor redials that
+# same server as an ordinary member. Nothing about the interface notices.
+
+. /usr/libexec/hysteria2-ppp-common
+
+CONFIG="$1"
+COUNT="$2"
+
+[ -n "$CONFIG" ] && [ -n "$COUNT" ] || exit 1
+
+SLOT=""
+
+log() {
+	logger -t hysteria -p "daemon.$1" "$CONFIG: $2"
+}
+
+# These cover the paths that end before the exec below, which is only the
+# no-free-slot case. They cannot cover the client itself ending: exec replaces
+# this shell, and traps go with it.
+#
+# The client is covered by something else. exec keeps the process id, so the pid
+# recorded in the claim is the client's for as long as it runs, and when it exits
+# the claim is left behind with a pid that answers nothing. hysteria_claim_slot
+# reaps exactly that. Releasing is therefore not something this script has to
+# survive long enough to do -- which is the property worth having, because the
+# case that matters is the one where it is killed outright.
+release() {
+	hysteria_release_slot "$CONFIG" "$SLOT"
+}
+trap 'release' EXIT
+trap 'release; exit 143' TERM
+trap 'release; exit 130' INT
+
+if ! SLOT=$(hysteria_claim_slot "$CONFIG" "$COUNT"); then
+	# Every server is already being dialled by a supervisor. Nothing useful is
+	# left to do here, and exiting hands pppd a hangup it will report normally.
+	log err "no free server slot to dial"
+	exit 1
+fi
+
+log notice "dialling $(hysteria_server_of "$CONFIG" "$SLOT") (slot $SLOT)"
+
+# This is the last thing this process can say about itself. exec replaces the
+# shell, so "dialling" is not a stage it passes through on the way to something
+# better -- it is the shell-side state for as long as the client runs, and the
+# client's own file below is what moves it on.
+#
+# Recording $$ rather than a pid learned later is correct for the same reason the
+# claim needs no retarget here: exec keeps the process id, so this names the
+# client from the moment it starts.
+hysteria_state_write "$CONFIG" "$SLOT" \
+	"pid=$$" "role=holder" "state=dialling" "since=$(hysteria_uptime)"
+
+# HYSTERIA_PPP_STATUS is where a terminal failure is recorded for the protocol
+# handler's teardown to read back. Only this dialer writes the interface-level
+# status file -- a member link's failure is its own, and netifd has one error
+# channel per interface.
+HYSTERIA_PPP_STATUS="/var/run/hysteria-$CONFIG.status"
+export HYSTERIA_PPP_STATUS
+
+# HYSTERIA_PPP_STATE is the other half, and it is per slot rather than per
+# interface: the status file answers "should netifd stop retrying this
+# interface", which is one question with one answer, while this answers "is this
+# particular server connected", which is the question a bundle has N of.
+#
+# It is also the only source for that answer. The shell can see that a process is
+# alive, which is not the same fact -- a client whose QUIC handshake is being
+# refused every two seconds is just as alive as one carrying traffic.
+HYSTERIA_PPP_STATE=$(hysteria_slot_client "$CONFIG" "$SLOT")
+export HYSTERIA_PPP_STATE
+
+# Where this slot records an MTU it negotiated below the MRU pppd was started
+# with. Per slot for the same reason as the file above: a bundle's links can
+# reach their servers by different paths, and the next bring-up takes the
+# narrowest of them. Nothing reads it during this session -- pppd's MRU is
+# already fixed -- which is exactly why it has to be written down.
+HYSTERIA_PPP_MTU=$(hysteria_slot_mtu "$CONFIG" "$SLOT")
+export HYSTERIA_PPP_MTU
+
+# Where this slot publishes what it carried, for the status page's per-server
+# figures. Per slot like everything else here, and for the strongest version of
+# the same reason: this is the one question about a bundle that has no answer
+# anywhere else on the router.
+HYSTERIA_PPP_BYTES=$(hysteria_slot_bytes "$CONFIG" "$SLOT")
+export HYSTERIA_PPP_BYTES
+
+# fd 2 explicitly, and only fd 2: stdin and stdout are the pty and carry PPP
+# frames, so nothing here may touch them.
+#
+# The status file above records a *terminal* reason -- a credential the server
+# refused, an identity it has no LNS group for. Everything else the client has to
+# say about why it could not reach a server goes to stderr, and until this
+# redirect that was the end of it: pppd would log "LCP: timeout sending
+# Config-Requests" and the client's own account of the failure existed nowhere.
+# An interface rebuilding every 36 seconds could not be told apart from one whose
+# concentrator was merely down.
+#
+# Truncated per attempt rather than appended across them, because the holder is
+# one process at a time and teardown replays whatever the last one wrote.
+ERRFILE=$(hysteria_holder_err "$CONFIG")
+CFG=$(hysteria_slot_yaml "$CONFIG" "$SLOT")
+
+# "true", not ":", and stderr redirected before the target: ":" is a POSIX
+# special builtin, so a redirection it cannot open exits this shell outright --
+# taking the transport with it. And the shell writes its "cannot create"
+# diagnostic to whatever stderr is at the moment the failing redirect is
+# processed, so 2>/dev/null has to come first to catch it. That is not
+# tidiness: fd 2 here may still be the pty, and a stray diagnostic on it would
+# be injected into the PPP byte stream.
+if true 2>/dev/null > "$ERRFILE" && chmod 600 "$ERRFILE" 2>/dev/null; then
+	exec /usr/bin/hysteria2-ppp client -c "$CFG" 2>>"$ERRFILE"
+fi
+
+# Falling through rather than failing. An exec whose redirect cannot be opened
+# takes the whole transport with it, and losing the link to protect a diagnostic
+# is the wrong trade in every case.
+log warn "cannot write $ERRFILE, client stderr will not be captured"
+exec /usr/bin/hysteria2-ppp client -c "$CFG"

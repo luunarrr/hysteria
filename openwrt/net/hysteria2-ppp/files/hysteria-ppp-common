@@ -1,0 +1,432 @@
+#!/bin/sh
+# Shared by the two things that dial a link: hysteria-ppp-dial, which is the pty
+# command for the pppd netifd runs, and hysteria-ppp-link, which supervises the
+# rest. Sourced, never executed.
+#
+# What it provides is a claim pool over the configured servers. Every link is
+# identical -- there is no anchor, no "first" server, and no link whose loss
+# costs more than any other's -- and the pool is what makes that true: a dialer
+# takes whichever server is free rather than being assigned one.
+#
+# Why a pool rather than a fixed server per dialer. One pppd owns the network
+# device: it is the process that created the PPP unit, ppp->owner is set once at
+# creation and there is no ioctl to transfer it, so its death is necessarily a
+# full interface rebuild. That much is irreducible. What is not irreducible is
+# that pppd being tied to a particular server, and the pool is what unties it.
+# When its transport dies, its slot returns to the pool, the process stays alive
+# holding the bundle, and whichever supervisor is idle dials that server again as
+# an ordinary member link. Capacity comes back without the device ever going.
+
+# hysteria_claims_dir is the pool. One symlink per claimed slot, its target the
+# claimant's pid: symlink(2) is the claim, because it is atomic and publishes the
+# owner in the same step, so it needs no lock file, no flock, and no cleanup
+# beyond the unlink. Reaping a dead claim needs a lock of its own -- see
+# hysteria_claim_slot for why removal is not serialised by the symlink.
+hysteria_claims_dir() { echo "/var/run/hysteria-$1.claims"; }
+
+hysteria_slot_yaml()   { echo "/var/run/hysteria-$1-$2.yaml"; }
+hysteria_slot_status() { echo "/var/run/hysteria-$1-$2.status"; }
+
+# What a slot's state is made of, and why it is three files rather than one.
+#
+# .state is what the shell knows: which process holds the slot, whether that
+# process is the holder or a member, and where it is in the dial cycle.
+# .client is what the Hysteria client knows: whether its transport reached the
+# server at all, and what the far end said when it stopped.
+#
+# They are separate because they have two writers that cannot coordinate -- a
+# POSIX shell and a Go process, with no lock between them. One file would need
+# read-modify-write from both, and the interleaving that loses is the one that
+# matters: a supervisor rewriting "dialling" over the client's "up" a moment
+# after it was written leaves a carrying link displayed as down until the next
+# transition, which for a healthy link is never. Each writer owns a file
+# outright and the reader merges them.
+#
+# .lasterr is the third because it answers a question about the SERVER rather
+# than about whoever is currently dialling it. A failed link releases its slot
+# immediately and the spare supervisor claims that same server seconds later, so
+# a reason stored with the claim is gone before anyone could read it -- which is
+# precisely the case an operator is looking at the page to understand. It
+# survives the claim and is cleared only when that server next carries traffic,
+# or when the interface is torn down.
+hysteria_slot_state()   { echo "/var/run/hysteria-$1-$2.state"; }
+hysteria_slot_client()  { echo "/var/run/hysteria-$1-$2.client"; }
+hysteria_slot_lasterr() { echo "/var/run/hysteria-$1-$2.lasterr"; }
+
+# hysteria_slot_pppdlog is a member pppd's own stdout.
+#
+# It went to /dev/null until this file existed, and the bundle join verdict went
+# with it. pppd announces "Link attached to <iface>" when a member joins and
+# "Couldn't create ppp interface <iface>: File exists" when the join is refused,
+# both through info(), and both on stdout -- nodetach leaves log_to_fd at 1, and
+# pppd does not pass its own fd 2 down that path. Neither line reaches the stderr
+# file, so a member that authenticated and was then refused by the bundle, which
+# is the entire symptom of an unpatched pppd, was invisible to the supervisor
+# standing over it. hysteria.sh says as much where it declines to probe for the
+# bug; this is the observation that replaces the probe.
+hysteria_slot_pppdlog() { echo "/var/run/hysteria-$1-$2.pppd.log"; }
+
+# hysteria_meta_file carries what a status reader needs to describe an interface
+# without opening anything else: the device name, whether it is bundling, and how
+# many slots there are.
+#
+# Deliberately not the .link env file, which holds all of that and the PPP
+# password, and is mode 600 for that reason. A reader that answers an
+# unprivileged status query should never have to open the file with the
+# credential in it, however careful it intends to be with what it prints.
+hysteria_meta_file() { echo "/var/run/hysteria-$1.meta"; }
+
+# These two live here rather than in hysteria.sh because the status reader needs
+# them and does not source a netifd protocol handler to get them. The gate is
+# also the only evidence a reader has that the peer accepted Multilink PPP at
+# all -- pppd exports BUNDLE solely where it created or joined a bundle, and
+# hysteria-ppp-up writes this file from exactly that place.
+# hysteria_slot_mtu names where a slot's client records an MTU it negotiated
+# below the MRU pppd was started with.
+#
+# Per slot, and read back as a minimum across slots, because a bundle's links can
+# reach their servers by different paths while pppd gives them all one MRU. Taking
+# the narrowest is the only figure every link can carry; taking the last writer's
+# would let a wide server undo a narrow one's finding on the next bring-up.
+#
+# Deliberately not cleared by hysteria_state_clear alongside .state and .client.
+# Those describe a session and are meaningless once it ends; this is a
+# measurement of the path, and its whole purpose is to outlive the session that
+# made it and configure the next one. /var/run is tmpfs, so a reboot still starts
+# from the configured value.
+#
+# The directory is a variable for one reason, and the name says so: the reader below scans it with a
+# glob, so a test cannot redirect it by overriding this function the way it does
+# for every other path here. It is never set in production.
+hysteria_slot_mtu() { echo "${HYSTERIA_TEST_RUN_DIR:-/var/run}/hysteria-$1-$2.mtu"; }
+
+# hysteria_slot_bytes echoes where a slot's client publishes what it has carried.
+#
+# Per slot because that is the only granularity at which the question has an
+# answer at all. The kernel keeps byte counters on the bundle unit and none on a
+# member channel -- no netdev, no /sys entry, no ioctl -- and a member pppd never
+# even computes its own, so the client process carrying the link is the only
+# thing on the router that can say what one server's share was.
+#
+# Cleared with the session, unlike .mtu beside it. That file is a measurement of
+# the path and its purpose is to outlive the session and configure the next one;
+# this describes traffic that a particular link carried, and a figure left behind
+# by a link that has gone would be read as the current one.
+hysteria_slot_bytes() { echo "/var/run/hysteria-$1-$2.bytes"; }
+
+# hysteria_learned_mru echoes the MRU pppd should be started with: the configured
+# one, unless a previous session measured the transport carrying less.
+#
+# This exists because nospawn cannot be fixed any other way. pppd is the parent,
+# its MRU came off a command line built before the client existed, and no
+# negotiated figure can reach it -- so the far end goes on sending frames sized to
+# a number the QUIC leg does not carry, and they are dropped one at a time. The
+# measurement has to survive a link and configure the next one.
+hysteria_learned_mru() {
+	local config="$1" configured="$2"
+	local best="$configured" f learned against key value
+
+	case "$configured" in
+		''|*[!0-9]*) return 0 ;;
+	esac
+
+	for f in "${HYSTERIA_TEST_RUN_DIR:-/var/run}"/hysteria-"$config"-*.mtu; do
+		[ -r "$f" ] || continue
+		learned=
+		against=
+		while IFS='=' read -r key value; do
+			case "$key" in
+				mtu) learned="$value" ;;
+				for) against="$value" ;;
+			esac
+		done < "$f"
+
+		# A figure measured against a different configuration says nothing about
+		# this one: an operator who changed ppp.mtu asked for it to be measured
+		# again, and a stale file that silently outranked them would be worse than
+		# no file at all.
+		[ "$against" = "$configured" ] || continue
+
+		# Downward only, and never below what PPP allows. The client writes this
+		# only when it is smaller, but /var/run is writable and this decides what
+		# the interface comes up with.
+		case "$learned" in
+			''|*[!0-9]*) continue ;;
+		esac
+		[ "$learned" -ge 576 ] || continue
+		[ "$learned" -lt "$best" ] && best="$learned"
+	done
+
+	echo "$best"
+}
+
+hysteria_gate_file() { echo "/var/run/hysteria-$1.bundle"; }
+hysteria_sup_pid()   { echo "/var/run/hysteria-$1-sup$2.pid"; }
+
+# Seconds since boot, as an integer. The monotonic clock is the only usable one
+# here: a router's wall clock is 1970 until NTP lands and then jumps years
+# forward, which would turn every link that came up before the sync into one
+# with a fifty-year uptime.
+hysteria_uptime() {
+	local up
+	read -r up _ < /proc/uptime 2>/dev/null || return 1
+	echo "${up%.*}"
+}
+
+# hysteria_holder_err is where the holder's client writes its stderr.
+#
+# A member's stderr is captured by its supervisor, which outlives its pppd and
+# replays it. The holder has no supervisor: its client is pppd's pty child and
+# dies with it, so the only thing that can read this back is the protocol
+# handler's own teardown -- which is why this is a file per interface rather
+# than per attempt, and why teardown removes it rather than the writer.
+hysteria_holder_err() { echo "/var/run/hysteria-$1.err"; }
+
+# hysteria_rotor_file remembers where the next scan should start.
+#
+# Deliberately not inside the claims directory: that is emptied at every setup,
+# and the case this exists for is exactly the one where setup runs again and
+# again. It is only a hint -- a lost or garbled write costs one repeated first
+# choice and nothing else.
+hysteria_rotor_file() { echo "/var/run/hysteria-$1.rotor"; }
+
+# hysteria_claim_slot claims a free slot in 1..count and echoes its number, or
+# fails when every slot is taken.
+#
+# A claim is a symlink whose target is the claimant's pid. symlink(2) fails with
+# EEXIST if the name is taken, so creating the claim and recording its owner are
+# a SINGLE atomic step. Doing it as mkdir-then-write-a-pid-file instead leaves a
+# window in which the claim exists with no owner, and a second claimant arriving
+# there reads no pid, calls the slot abandoned, and takes one that was just won.
+#
+# Reaping needs a second lock, and this is the part that is easy to get wrong.
+# The symlink serialises creation but NOT removal: two claimants that both read
+# the same dead pid interleave as rm(A), ln(A) wins, rm(B) deletes A's live
+# claim, ln(B) wins -- and both return the same slot, so two pppd dial one
+# concentrator under one account. The mkdir below picks exactly one reaper; the
+# losers move on rather than racing. Covered by tests/claim-pool.sh, which seeds
+# every slot with a dead owner precisely to exercise this path.
+#
+# The scan starts at a rotating offset. Without that the dialer -- the only
+# claimant that can run before a bundle exists, since every supervisor is gated
+# on one -- takes slot 1 every time, and a first server that is simply down
+# holds the interface at zero links while every other concentrator sits idle.
+# That would put the anchor back, just relocated from "the first pppd's server"
+# to "slot 1".
+#
+# Callers use it as "SLOT=$(hysteria_claim_slot ...)", which runs it in a
+# subshell -- and the pid it records is still the right one. POSIX specifies $$
+# as the process id of the *invoking* shell, not of the subshell evaluating the
+# substitution. Verified against dash and bash; ash follows the same rule.
+hysteria_claim_slot() {
+	local config="$1" count="$2"
+	local dir n holder rotor start i=0
+
+	dir=$(hysteria_claims_dir "$config")
+	mkdir -p "$dir" 2>/dev/null
+
+	rotor=$(hysteria_rotor_file "$config")
+	start=0
+	[ -r "$rotor" ] && read -r start < "$rotor" 2>/dev/null
+	case "$start" in "" | *[!0-9]*) start=0 ;; esac
+
+	while [ "$i" -lt "$count" ]; do
+		n=$(((start + i) % count + 1))
+		i=$((i + 1))
+
+		if ln -s "$$" "$dir/$n" 2>/dev/null; then
+			echo $((n % count)) > "$rotor" 2>/dev/null
+			echo "$n"
+			return 0
+		fi
+
+		holder=$(readlink "$dir/$n" 2>/dev/null)
+		if [ -z "$holder" ]; then
+			# Released between the attempt above and this read. Retry: for a free
+			# slot the symlink is all the serialisation needed.
+			if ln -s "$$" "$dir/$n" 2>/dev/null; then
+				echo $((n % count)) > "$rotor" 2>/dev/null
+				echo "$n"
+				return 0
+			fi
+		elif ! kill -0 "$holder" 2>/dev/null; then
+			if mkdir "$dir/$n.reap" 2>/dev/null; then
+				# Re-read under the lock: the owner may have been replaced between
+				# the test above and here.
+				holder=$(readlink "$dir/$n" 2>/dev/null)
+				if [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; then
+					rm -f "$dir/$n"
+					if ln -s "$$" "$dir/$n" 2>/dev/null; then
+						rmdir "$dir/$n.reap" 2>/dev/null
+						echo $((n % count)) > "$rotor" 2>/dev/null
+						echo "$n"
+						return 0
+					fi
+				fi
+				rmdir "$dir/$n.reap" 2>/dev/null
+			fi
+		fi
+	done
+	return 1
+}
+
+# hysteria_claim_retarget points a claim we already hold at another pid, so that
+# it names the process actually holding the server rather than the shell that
+# arranged for it.
+#
+# The supervisor needs this and the dialer does not. The dialer execs, which
+# keeps its pid, so its claim names the client all along. A supervisor stays a
+# separate process from the pppd it starts, and pppd 2.5.2 sets no
+# PR_SET_PDEATHSIG and never checks its parent -- so a supervisor killed outright
+# leaves an orphaned pppd whose channel is still in the bundle, on a claim that
+# now names a dead shell. The idle supervisor reaps it within seconds and dials a
+# second session to the same concentrator, with the same account and the same
+# endpoint discriminator.
+#
+# rename(2) is what makes the swap atomic. "ln -sfn" is not.
+hysteria_claim_retarget() {
+	local link tmp
+	link="$(hysteria_claims_dir "$1")/$2"
+	[ "$(readlink "$link" 2>/dev/null)" = "${HY_CLAIM_PID:-$$}" ] || return 1
+	tmp="$link.rt$$"
+	rm -f "$tmp"
+	ln -s "$3" "$tmp" 2>/dev/null || return 1
+	mv -f "$tmp" "$link" 2>/dev/null || {
+		rm -f "$tmp"
+		return 1
+	}
+	HY_CLAIM_PID="$3"
+	return 0
+}
+
+# hysteria_release_slot gives a slot back, but only if it is still ours: a slot
+# reaped from us while we were dying belongs to whoever reaped it.
+hysteria_release_slot() {
+	local config="$1" slot="$2"
+	local link
+
+	[ -n "$slot" ] || return 0
+	link="$(hysteria_claims_dir "$config")/$slot"
+	[ "$(readlink "$link" 2>/dev/null)" = "${HY_CLAIM_PID:-$$}" ] || return 0
+	rm -f "$link"
+	# The claim and the state that describes it go together. Leaving the state
+	# behind would show the next reader a carrying link held by a pid that has
+	# already exited -- and the reader's staleness check compares the state's pid
+	# against the claim, which by then names somebody else entirely.
+	#
+	# .lasterr is not removed here. It belongs to the server, not to this claim,
+	# and the moment worth reading it is exactly this one.
+	hysteria_state_clear "$config" "$slot"
+	return 0
+}
+
+# hysteria_state_clear drops the per-claim state for a slot.
+#
+# It exists separately from the release above because release frequently declines
+# to act. Once pppd has exited, the claim names a pid that answers nothing and is
+# no longer ours by the readlink test -- deliberately, since reaping a dead claim
+# is hysteria_claim_slot's job and doing it here would race it. But the state file
+# beside it describes an attempt that is definitively over, and a reader looking
+# at the two together cannot tell that from the files alone. Whoever knows the
+# attempt has ended says so.
+hysteria_state_clear() {
+	[ -n "$2" ] || return 0
+	rm -f "$(hysteria_slot_state "$1" "$2")" \
+		"$(hysteria_slot_client "$1" "$2")" \
+		"$(hysteria_slot_bytes "$1" "$2")"
+	return 0
+}
+
+# hysteria_state_write replaces a slot's shell-side state file with the key=value
+# words it is given.
+#
+# Written to a temporary name and renamed. A reader arriving between the truncate
+# and the write of "> file" sees an empty file and reports a working link as
+# unknown; rename(2) has no such window, and the temporary is keyed on the pid so
+# two writers cannot collide on it. This is the same reason hysteria_claim_retarget
+# does not use "ln -sfn".
+#
+# Absent keys mean "not known" and never "false" -- a reader that cannot tell
+# whether a member joined has to say so rather than pick an answer.
+hysteria_state_write() {
+	local config="$1" slot="$2"
+	local file tmp
+	shift 2
+
+	[ -n "$slot" ] || return 0
+	file=$(hysteria_slot_state "$config" "$slot")
+	tmp="$file.$$"
+
+	rm -f "$tmp"
+	{
+		while [ "$#" -gt 0 ]; do
+			printf '%s\n' "$1"
+			shift
+		done
+	} > "$tmp" 2>/dev/null || {
+		rm -f "$tmp"
+		return 1
+	}
+	mv -f "$tmp" "$file" 2>/dev/null || {
+		rm -f "$tmp"
+		return 1
+	}
+	return 0
+}
+
+# hysteria_lasterr_write records why this server's last attempt ended, and
+# hysteria_lasterr_clear forgets it once the same server carries traffic again.
+#
+# Kept out of hysteria_state_write's file on purpose: see the note beside
+# hysteria_slot_lasterr for why a reason tied to a claim is unreadable by the
+# time anyone wants it.
+hysteria_lasterr_write() {
+	local config="$1" slot="$2" code="$3" detail="$4"
+	local file tmp
+
+	[ -n "$slot" ] && [ -n "$code" ] || return 0
+	file=$(hysteria_slot_lasterr "$config" "$slot")
+	tmp="$file.$$"
+
+	rm -f "$tmp"
+	# "if" rather than "[ ... ] && printf", and the difference is the whole bug
+	# this once had.
+	#
+	# A group's exit status is its last command's. Written as a && list, an empty
+	# detail makes the test itself the last thing to run and it returns 1, so the
+	# group reports failure, the "||" below fires, and a file that was written
+	# perfectly well is deleted instead of renamed. An "if" with no else returns 0
+	# when its condition is false, which is the honest answer here: nothing was
+	# supposed to be written, and nothing failed.
+	#
+	# It went unnoticed because an empty detail is not the edge case -- it is the
+	# common one. Only an LNS-supplied message fills it, so every locally-observed
+	# failure (a dial that timed out, a transport that closed) recorded nothing at
+	# all. A server that had been failing for an hour showed a blank reason.
+	{
+		printf 'code=%s\n' "$code"
+		printf 'at=%s\n' "$(hysteria_uptime)"
+		if [ -n "$detail" ]; then
+			printf 'detail=%s\n' "$detail"
+		fi
+	} > "$tmp" 2>/dev/null || {
+		rm -f "$tmp"
+		return 1
+	}
+	mv -f "$tmp" "$file" 2>/dev/null || {
+		rm -f "$tmp"
+		return 1
+	}
+	return 0
+}
+
+hysteria_lasterr_clear() {
+	[ -n "$2" ] || return 0
+	rm -f "$(hysteria_slot_lasterr "$1" "$2")"
+}
+
+# hysteria_server_of echoes the server address a slot dials, read back from the
+# YAML the protocol handler wrote. Used for logging only.
+hysteria_server_of() {
+	sed -n "s/^server: //p" "$(hysteria_slot_yaml "$1" "$2")" 2>/dev/null | tr -d "'\""
+}

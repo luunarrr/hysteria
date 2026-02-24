@@ -1,0 +1,66 @@
+#!/bin/sh
+# rpcd plugin exposing the link status of every Hysteria interface on ubus.
+#
+#   ubus call hysteria interfaces
+#   ubus call hysteria status '{"interface":"wan"}'
+#
+# rpcd invokes this as "<script> list" to learn the method signatures and
+# "<script> call <method>" with the arguments on stdin. Read-only: there is no
+# method here that changes anything, which is what lets the ACL beside it be
+# granted to an ordinary LuCI session.
+#
+# A shell plugin rather than a ucode one because everything else on this side of
+# the package is POSIX sh, and because the alternative adds rpcd-mod-ucode to the
+# dependency list of a package whose entire job is to bring a link up. The cost
+# is a fork per poll, over at most sixteen slots, which is not a figure that
+# matters next to the pppd it is describing.
+
+# shellcheck disable=SC1091  # installed alongside this file by the package
+command -v hysteria_status_json >/dev/null 2>&1 ||
+	. /usr/libexec/hysteria2-ppp-statuslib
+
+case "$1" in
+list)
+	# The interface name is declared as a string so rpcd renders a signature for
+	# it. It is still validated in the collector: rpcd type-checks the argument,
+	# it does not check that the value is a plausible interface name, and the value
+	# is what reaches a path.
+	echo '{ "interfaces": {}, "status": { "interface": "str" } }'
+	;;
+call)
+	case "$2" in
+	interfaces)
+		printf '{"interfaces":['
+		first=1
+		for name in $(hysteria_status_interfaces); do
+			[ "$first" = 1 ] || printf ','
+			first=0
+			printf '"%s"' "$(hysteria_json_escape "$name")"
+		done
+		printf ']}\n'
+		;;
+	status)
+		# jsonfilter rather than a parse of our own: it ships in base alongside
+		# netifd and is what every other rpcd shell plugin uses. An absent or
+		# malformed argument yields an empty string, which the collector rejects.
+		read -r input
+		iface=$(printf '%s' "$input" | jsonfilter -q -e '@.interface')
+
+		if [ -n "$iface" ]; then
+			# One interface. A name that does not resolve is reported as an empty
+			# object rather than as an error: an interface can legitimately go away
+			# between a page loading and its next poll, and a red error box for a
+			# link somebody has just taken down is noise, not information.
+			hysteria_status_json "$iface" || printf '{}'
+			echo
+		else
+			hysteria_status_all_json
+			echo
+		fi
+		;;
+	*)
+		echo '{}'
+		;;
+	esac
+	;;
+esac
