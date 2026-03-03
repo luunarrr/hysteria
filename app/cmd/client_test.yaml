@@ -35,6 +35,7 @@ tls:
   sni: another.example.com
   insecure: true
   pinSHA256: 114515DEADBEEF
+  skipHostnameVerify: true
   ca: custom_ca.crt
   clientCertificate: client.crt
   clientKey: client.key
@@ -130,3 +131,8 @@ tun:
     ipv6: [ "2000::/3" ]
     ipv4Exclude: [ 192.0.2.1/32 ]
     ipv6Exclude: [ "2001:db8::1/128" ]
+
+camouflage:
+  enabled: true
+  secret: "c2VjcmV0LWtleS0zMi1ieXRlcy1sb25nLXBhZA=="
+  serverIP: "203.0.113.7"

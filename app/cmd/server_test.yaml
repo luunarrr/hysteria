@@ -195,3 +195,13 @@ masquerade:
   listenHTTP: :80
   listenHTTPS: :443
   forceHTTPS: true
+
+camouflage:
+  dest: "www.bing.com:443"
+  secrets:
+    fleet: "c2VjcmV0LWtleS0zMi1ieXRlcy1sb25nLXBhZA=="
+  listenTCP: ":443"
+  serverAddr: "203.0.113.7"
+  rateLimit:
+    threshold: 100
+    window: 5m
