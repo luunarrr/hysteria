@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,6 +38,7 @@ import (
 	"github.com/apernet/hysteria/extras/v2/auth"
 	"github.com/apernet/hysteria/extras/v2/correctnet"
 	"github.com/apernet/hysteria/extras/v2/masq"
+	camo "github.com/apernet/hysteria/extras/v2/camouflage"
 	"github.com/apernet/hysteria/extras/v2/obfs"
 	"github.com/apernet/hysteria/extras/v2/outbounds"
 	"github.com/apernet/hysteria/extras/v2/sniff"
@@ -77,6 +79,20 @@ type serverConfig struct {
 	Outbounds             []serverConfigOutboundEntry `mapstructure:"outbounds"`
 	TrafficStats          serverConfigTrafficStats    `mapstructure:"trafficStats"`
 	Masquerade            serverConfigMasquerade      `mapstructure:"masquerade"`
+	Camouflage            *serverConfigCamouflage     `mapstructure:"camouflage"`
+}
+
+type serverConfigCamouflageRateLimit struct {
+	Threshold int           `mapstructure:"threshold"`
+	Window    time.Duration `mapstructure:"window"`
+}
+
+type serverConfigCamouflage struct {
+	Dest       string                          `mapstructure:"dest"`
+	Secrets    map[string]string               `mapstructure:"secrets"`
+	ListenTCP  string                          `mapstructure:"listenTCP"`
+	ServerAddr string                          `mapstructure:"serverAddr"`
+	RateLimit  serverConfigCamouflageRateLimit `mapstructure:"rateLimit"`
 }
 
 type serverConfigObfsSalamander struct {
@@ -292,30 +308,108 @@ func (c *serverConfig) fillConn(hyConfig *server.Config) error {
 			return configError{Field: "listen", Err: err}
 		}
 	}
-	switch strings.ToLower(c.Obfs.Type) {
-	case "", "plain":
-		hyConfig.Conn = packetConn
-		hyConfig.Cleanup = cleanup
-		return nil
-	case "salamander":
-		ob, err := obfs.NewSalamanderObfuscator([]byte(c.Obfs.Salamander.Password))
+
+	isSalamander := strings.EqualFold(c.Obfs.Type, "salamander")
+
+	if c.Camouflage != nil && !isSalamander {
+		filterConn, err := c.buildCamouflageFilter(packetConn)
 		if err != nil {
 			_ = conn.Close()
 			if cleanup != nil {
 				_ = cleanup.Close()
 			}
-			return configError{Field: "obfs.salamander.password", Err: err}
+			return err
 		}
-		hyConfig.Conn = obfs.WrapPacketConn(packetConn, ob)
+		hyConfig.Conn = filterConn
 		hyConfig.Cleanup = cleanup
-		return nil
-	default:
-		_ = conn.Close()
-		if cleanup != nil {
-			_ = cleanup.Close()
+	} else {
+		switch strings.ToLower(c.Obfs.Type) {
+		case "", "plain":
+			hyConfig.Conn = packetConn
+			hyConfig.Cleanup = cleanup
+		case "salamander":
+			ob, err := obfs.NewSalamanderObfuscator([]byte(c.Obfs.Salamander.Password))
+			if err != nil {
+				_ = conn.Close()
+				if cleanup != nil {
+					_ = cleanup.Close()
+				}
+				return configError{Field: "obfs.salamander.password", Err: err}
+			}
+			hyConfig.Conn = obfs.WrapPacketConn(packetConn, ob)
+			hyConfig.Cleanup = cleanup
+		default:
+			_ = conn.Close()
+			if cleanup != nil {
+				_ = cleanup.Close()
+			}
+			return configError{Field: "obfs.type", Err: errors.New("unsupported obfuscation type")}
 		}
-		return configError{Field: "obfs.type", Err: errors.New("unsupported obfuscation type")}
 	}
+
+	// TCP relay: started independently if listenTCP is set
+	if c.Camouflage != nil && c.Camouflage.ListenTCP != "" {
+		if c.Camouflage.Dest == "" {
+			return configError{Field: "camouflage.dest", Err: errors.New("dest is required when listenTCP is set")}
+		}
+		tcpRelay := camo.NewTCPRelay(c.Camouflage.ListenTCP, c.Camouflage.Dest)
+		go func() {
+			if err := tcpRelay.Serve(); err != nil {
+				logger.Error("camouflage TCP relay error", zap.Error(err))
+			}
+		}()
+	}
+
+	return nil
+}
+
+func (c *serverConfig) buildCamouflageFilter(conn net.PacketConn) (net.PacketConn, error) {
+	if c.Camouflage.Dest == "" {
+		return nil, configError{Field: "camouflage.dest", Err: errors.New("dest is required")}
+	}
+	if len(c.Camouflage.Secrets) == 0 {
+		return nil, configError{Field: "camouflage.secrets", Err: errors.New("at least one secret is required")}
+	}
+
+	secrets := make(map[string][]byte, len(c.Camouflage.Secrets))
+	for label, b64 := range c.Camouflage.Secrets {
+		psk, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			return nil, configError{Field: "camouflage.secrets." + label, Err: err}
+		}
+		secrets[label] = psk
+	}
+
+	var serverIP net.IP
+	if c.Camouflage.ServerAddr != "" {
+		serverIP = net.ParseIP(c.Camouflage.ServerAddr)
+		if serverIP == nil {
+			return nil, configError{Field: "camouflage.serverAddr", Err: errors.New("invalid IP address")}
+		}
+	} else {
+		logger.Warn("camouflage: serverAddr not set, server_id check disabled")
+	}
+
+	rl := camo.NewRateLimiter(c.Camouflage.RateLimit.Threshold, c.Camouflage.RateLimit.Window)
+
+	udpRelay, err := camo.NewUDPRelay(c.Camouflage.Dest, conn)
+	if err != nil {
+		return nil, configError{Field: "camouflage.dest", Err: err}
+	}
+
+	return camo.WrapPacketConn(conn, camo.FilterConfig{
+		Secrets:     secrets,
+		ServerIP:    serverIP,
+		RateLimiter: rl,
+		UDPRelay:    udpRelay,
+		AlertFunc: func(src net.Addr, reason, label string) {
+			logger.Warn("camouflage alert",
+				zap.String("src", src.String()),
+				zap.String("reason", reason),
+				zap.String("label", label),
+			)
+		},
+	}), nil
 }
 
 func resolveServerListenAddr(listenAddr string) (*net.UDPAddr, eUtils.PortUnion, error) {

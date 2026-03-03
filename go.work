@@ -7,3 +7,6 @@ use (
 	./core
 	./extras
 )
+
+replace github.com/apernet/quic-go => github.com/luunarrr/quic-go v0.0.0-20260414023000-fa89fc20b6ac
+

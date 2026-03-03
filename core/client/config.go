@@ -118,6 +118,7 @@ type QUICConfig struct {
 	MaxIdleTimeout                 time.Duration
 	KeepAlivePeriod                time.Duration
 	DisablePathMTUDiscovery        bool // The server may still override this to true on unsupported platforms.
+	InitialDestConnectionID        []byte
 }
 
 type CongestionConfig struct {
