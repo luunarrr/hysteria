@@ -87,6 +87,7 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 		EnableDatagrams:                true,
 		MaxDatagramFrameSize:           protocol.MaxDatagramFrameSize,
 		DisablePathManager:             true,
+		InitialDestConnectionID:        c.config.QUICConfig.InitialDestConnectionID,
 	}
 	// Prepare RoundTripper
 	var conn *quic.Conn

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -33,6 +34,7 @@ import (
 	"github.com/apernet/hysteria/app/v2/internal/url"
 	"github.com/apernet/hysteria/app/v2/internal/utils"
 	"github.com/apernet/hysteria/core/v2/client"
+	camo "github.com/apernet/hysteria/extras/v2/camouflage"
 	"github.com/apernet/hysteria/extras/v2/correctnet"
 	"github.com/apernet/hysteria/extras/v2/obfs"
 	"github.com/apernet/hysteria/extras/v2/transport/udphop"
@@ -58,24 +60,30 @@ func initClientFlags() {
 	clientCmd.Flags().BoolVar(&showQR, "qr", false, "show QR code for server config sharing")
 }
 
+type clientConfigCamouflage struct {
+	Secret   string `mapstructure:"secret"`
+	ServerIP string `mapstructure:"serverIP"`
+}
+
 type clientConfig struct {
-	Server        string                `mapstructure:"server"`
-	Auth          string                `mapstructure:"auth"`
-	Transport     clientConfigTransport `mapstructure:"transport"`
-	Obfs          clientConfigObfs      `mapstructure:"obfs"`
-	TLS           clientConfigTLS       `mapstructure:"tls"`
-	QUIC          clientConfigQUIC      `mapstructure:"quic"`
-	Bandwidth     clientConfigBandwidth `mapstructure:"bandwidth"`
-	FastOpen      bool                  `mapstructure:"fastOpen"`
-	Lazy          bool                  `mapstructure:"lazy"`
-	SOCKS5        *socks5Config         `mapstructure:"socks5"`
-	HTTP          *httpConfig           `mapstructure:"http"`
-	TCPForwarding []tcpForwardingEntry  `mapstructure:"tcpForwarding"`
-	UDPForwarding []udpForwardingEntry  `mapstructure:"udpForwarding"`
-	TCPTProxy     *tcpTProxyConfig      `mapstructure:"tcpTProxy"`
-	UDPTProxy     *udpTProxyConfig      `mapstructure:"udpTProxy"`
-	TCPRedirect   *tcpRedirectConfig    `mapstructure:"tcpRedirect"`
-	TUN           *tunConfig            `mapstructure:"tun"`
+	Server        string                  `mapstructure:"server"`
+	Auth          string                  `mapstructure:"auth"`
+	Transport     clientConfigTransport   `mapstructure:"transport"`
+	Obfs          clientConfigObfs        `mapstructure:"obfs"`
+	TLS           clientConfigTLS         `mapstructure:"tls"`
+	QUIC          clientConfigQUIC        `mapstructure:"quic"`
+	Bandwidth     clientConfigBandwidth   `mapstructure:"bandwidth"`
+	FastOpen      bool                    `mapstructure:"fastOpen"`
+	Lazy          bool                    `mapstructure:"lazy"`
+	Camouflage    *clientConfigCamouflage `mapstructure:"camouflage"`
+	SOCKS5        *socks5Config           `mapstructure:"socks5"`
+	HTTP          *httpConfig             `mapstructure:"http"`
+	TCPForwarding []tcpForwardingEntry    `mapstructure:"tcpForwarding"`
+	UDPForwarding []udpForwardingEntry    `mapstructure:"udpForwarding"`
+	TCPTProxy     *tcpTProxyConfig        `mapstructure:"tcpTProxy"`
+	UDPTProxy     *udpTProxyConfig        `mapstructure:"udpTProxy"`
+	TCPRedirect   *tcpRedirectConfig      `mapstructure:"tcpRedirect"`
+	TUN           *tunConfig              `mapstructure:"tun"`
 }
 
 type clientConfigTransportUDP struct {
@@ -97,12 +105,13 @@ type clientConfigObfs struct {
 }
 
 type clientConfigTLS struct {
-	SNI               string `mapstructure:"sni"`
-	Insecure          bool   `mapstructure:"insecure"`
-	PinSHA256         string `mapstructure:"pinSHA256"`
-	CA                string `mapstructure:"ca"`
-	ClientCertificate string `mapstructure:"clientCertificate"`
-	ClientKey         string `mapstructure:"clientKey"`
+	SNI                string `mapstructure:"sni"`
+	Insecure           bool   `mapstructure:"insecure"`
+	SkipHostnameVerify bool   `mapstructure:"skipHostnameVerify"`
+	PinSHA256          string `mapstructure:"pinSHA256"`
+	CA                 string `mapstructure:"ca"`
+	ClientCertificate  string `mapstructure:"clientCertificate"`
+	ClientKey          string `mapstructure:"clientKey"`
 }
 
 type clientConfigQUIC struct {
@@ -272,29 +281,65 @@ func (c *clientConfig) fillTLSConfig(hyConfig *client.Config) error {
 		hyConfig.TLSConfig.ServerName = c.TLS.SNI
 	}
 	hyConfig.TLSConfig.InsecureSkipVerify = c.TLS.Insecure
-	if c.TLS.PinSHA256 != "" {
-		nHash := normalizeCertHash(c.TLS.PinSHA256)
-		hyConfig.TLSConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			cert := rawCerts[0] // only check the end-entity cert hash in the chain of trust
-			hash := sha256.Sum256(cert)
-			hashHex := hex.EncodeToString(hash[:])
-			if hashHex == nHash {
-				return nil
-			}
-			// No match
-			return errors.New("no certificate matches the pinned hash")
-		}
-	}
+
+	// Load CA pool early so both skipHostnameVerify and RootCAs can use it
+	var caPool *x509.CertPool
 	if c.TLS.CA != "" {
 		ca, err := os.ReadFile(c.TLS.CA)
 		if err != nil {
 			return configError{Field: "tls.ca", Err: err}
 		}
-		cPool := x509.NewCertPool()
-		if !cPool.AppendCertsFromPEM(ca) {
+		caPool = x509.NewCertPool()
+		if !caPool.AppendCertsFromPEM(ca) {
 			return configError{Field: "tls.ca", Err: errors.New("failed to parse CA certificate")}
 		}
-		hyConfig.TLSConfig.RootCAs = cPool
+		hyConfig.TLSConfig.RootCAs = caPool
+	}
+
+	// Build a composed VerifyPeerCertificate callback that handles
+	// skipHostnameVerify (chain-only verification) and pinSHA256.
+	var pinHash string
+	if c.TLS.PinSHA256 != "" {
+		pinHash = normalizeCertHash(c.TLS.PinSHA256)
+	}
+
+	if c.TLS.SkipHostnameVerify || pinHash != "" {
+		verifyPool := caPool
+		skipHostname := c.TLS.SkipHostnameVerify
+
+		if skipHostname {
+			hyConfig.TLSConfig.InsecureSkipVerify = true
+		}
+
+		hyConfig.TLSConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if skipHostname && verifyPool != nil {
+				certs := make([]*x509.Certificate, len(rawCerts))
+				for i, raw := range rawCerts {
+					cert, err := x509.ParseCertificate(raw)
+					if err != nil {
+						return err
+					}
+					certs[i] = cert
+				}
+				opts := x509.VerifyOptions{
+					Roots:         verifyPool,
+					Intermediates: x509.NewCertPool(),
+				}
+				for _, ic := range certs[1:] {
+					opts.Intermediates.AddCert(ic)
+				}
+				if _, err := certs[0].Verify(opts); err != nil {
+					return err
+				}
+			}
+			if pinHash != "" {
+				hash := sha256.Sum256(rawCerts[0])
+				if hex.EncodeToString(hash[:]) != pinHash {
+					return errors.New("no certificate matches the pinned hash")
+				}
+			}
+			return nil
+		}
 	}
 	if c.TLS.ClientCertificate != "" && c.TLS.ClientKey != "" {
 		certLoader := &utils.LocalCertificateLoader{
@@ -457,6 +502,7 @@ func (c *clientConfig) Config() (*client.Config, error) {
 		c.fillAuth,
 		c.fillTLSConfig,
 		c.fillQUICConfig,
+		c.fillCamouflage,
 		c.fillBandwidthConfig,
 		c.fillFastOpen,
 	}
@@ -466,6 +512,34 @@ func (c *clientConfig) Config() (*client.Config, error) {
 		}
 	}
 	return hyConfig, nil
+}
+
+func (c *clientConfig) fillCamouflage(hyConfig *client.Config) error {
+	if c.Camouflage == nil {
+		return nil
+	}
+	if c.Camouflage.Secret == "" {
+		return configError{Field: "camouflage.secret", Err: errors.New("secret is required")}
+	}
+	if c.Camouflage.ServerIP == "" {
+		return configError{Field: "camouflage.serverIP", Err: errors.New("serverIP is required")}
+	}
+
+	psk, err := base64.StdEncoding.DecodeString(c.Camouflage.Secret)
+	if err != nil {
+		return configError{Field: "camouflage.secret", Err: err}
+	}
+	serverIP := net.ParseIP(c.Camouflage.ServerIP)
+	if serverIP == nil {
+		return configError{Field: "camouflage.serverIP", Err: errors.New("invalid IP address")}
+	}
+
+	dcid, err := camo.GenerateDCID(psk, serverIP, 0)
+	if err != nil {
+		return configError{Field: "camouflage", Err: err}
+	}
+	hyConfig.QUICConfig.InitialDestConnectionID = dcid
+	return nil
 }
 
 func runClientCmd(cmd *cobra.Command, args []string) {
