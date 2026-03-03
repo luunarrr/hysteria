@@ -93,6 +93,7 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 		OmitMaxDatagramFrameSize:       true,
 		DisablePathManager:             true,
 		ChromeParrot:                   !c.config.QUICConfig.DisableChromeParrot,
+		InitialDestConnectionID:        c.config.QUICConfig.InitialDestConnectionID,
 	}
 	tr := &quic.Transport{Conn: pktConn}
 	if !c.config.QUICConfig.DisableChromeParrot {
