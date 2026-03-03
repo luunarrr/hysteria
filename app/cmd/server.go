@@ -44,6 +44,7 @@ import (
 	"github.com/apernet/hysteria/app/v2/internal/utils"
 	"github.com/apernet/hysteria/core/v2/server"
 	"github.com/apernet/hysteria/extras/v2/auth"
+	camo "github.com/apernet/hysteria/extras/v2/camouflage"
 	"github.com/apernet/hysteria/extras/v2/correctnet"
 	"github.com/apernet/hysteria/extras/v2/masq"
 	"github.com/apernet/hysteria/extras/v2/obfs"
@@ -91,6 +92,7 @@ type serverConfig struct {
 	TrafficStats          serverConfigTrafficStats    `mapstructure:"trafficStats"`
 	Masquerade            serverConfigMasquerade      `mapstructure:"masquerade"`
 	PPP                   pppServerConfig             `mapstructure:"ppp"`
+	Camouflage            *serverConfigCamouflage     `mapstructure:"camouflage"`
 }
 
 type pppServerConfig struct {
@@ -133,6 +135,63 @@ type pppLNSConfig struct {
 type pppRouteConfig struct {
 	ID    string `mapstructure:"id"`
 	Group string `mapstructure:"group"`
+}
+
+type serverConfigCamouflageRateLimit struct {
+	Threshold int           `mapstructure:"threshold"`
+	Window    time.Duration `mapstructure:"window"`
+}
+
+// serverConfigCamouflage configures the UDP side of camouflage only.
+//
+// TCP is deliberately absent. An earlier version listened on tcp/443 and
+// relayed accepted connections to dest with an io.Copy, which handed a prober
+// the one thing camouflage exists to withhold: the local kernel. Terminating
+// TCP means the SYN+ACK is ours, so option order, window scale, timestamp tick
+// rate and the implied uptime all describe this host and not dest. Worse, the
+// accept is instant while the dial to dest is not -- a prober measures a 10ms
+// TCP handshake followed by a 190ms wait for the ServerHello, which no origin
+// server produces, and which needs no fingerprint database to spot.
+//
+// Nothing in userspace can avoid that, because terminating the connection is
+// what creates it. Forwarding at L3 can, and needs no code here at all:
+// Hysteria is QUIC-only, so every TCP connection to the listen port is a probe
+// by construction and there is nothing to classify.
+//
+//	nft add rule ip nat prerouting tcp dport 443 dnat to <dest-ip>:443
+//	nft add rule ip nat postrouting ip daddr <dest-ip> tcp dport 443 masquerade
+//	sysctl -w net.ipv4.ip_forward=1
+//
+// Deploy that only alongside a drop-everything-else posture -- no ICMP echo
+// reply, no RST from closed ports. A host whose tcp/443 answers with dest's
+// stack while every other port answers with Linux's is running two operating
+// systems on one address, which is a louder anomaly than the consistent Linux
+// box it replaced.
+type serverConfigCamouflage struct {
+	Dest    string            `mapstructure:"dest"`
+	Secrets map[string]string `mapstructure:"secrets"`
+
+	// ServerAddr names every address clients dial this server at, and it is a
+	// list because a server generally has more than one.
+	//
+	// A client mints its token against the address it dialled, so this is the
+	// set the token is checked against; a token naming an address that is not
+	// here is handed to the decoy, and the client sees a timeout with nothing
+	// logged its side. One address was enough only as long as every client
+	// reached the server the same way. A multilink bundle does not: each member
+	// crosses its own concentrator address by construction, and naming one of
+	// them fails all the others.
+	//
+	// These are the addresses as CLIENTS see them, which behind NAT are not the
+	// addresses this host holds. The arrival address is accepted too and covers
+	// the directly-addressed case on its own, but nothing the kernel reports can
+	// recover a public address that DNAT has already rewritten -- so a NAT'd
+	// deployment has to write its public addresses down here.
+	//
+	// Accepts a single address as well, so an existing one-address config keeps
+	// working unchanged. Leave it empty to skip the check entirely.
+	ServerAddr []string                        `mapstructure:"serverAddr"`
+	RateLimit  serverConfigCamouflageRateLimit `mapstructure:"rateLimit"`
 }
 
 type serverConfigRealm struct {
@@ -376,16 +435,36 @@ func (c *serverConfig) fillConn(hyConfig *server.Config) error {
 			return configError{Field: "listen", Err: err}
 		}
 	}
-	wrapped, err := c.wrapObfs(packetConn)
-	if err != nil {
-		_ = conn.Close()
-		if cleanup != nil {
-			_ = cleanup.Close()
+	if c.Camouflage != nil {
+		if obfsType := strings.ToLower(c.Obfs.Type); obfsType != "" && obfsType != "plain" {
+			_ = conn.Close()
+			if cleanup != nil {
+				_ = cleanup.Close()
+			}
+			return configError{Field: "camouflage", Err: errors.New("camouflage cannot be combined with obfs, which hides the QUIC header the filter inspects")}
 		}
-		return err
+		filterConn, err := c.buildCamouflageFilter(packetConn)
+		if err != nil {
+			_ = conn.Close()
+			if cleanup != nil {
+				_ = cleanup.Close()
+			}
+			return err
+		}
+		hyConfig.Conn = filterConn
+	} else {
+		wrapped, err := c.wrapObfs(packetConn)
+		if err != nil {
+			_ = conn.Close()
+			if cleanup != nil {
+				_ = cleanup.Close()
+			}
+			return err
+		}
+		hyConfig.Conn = wrapped
 	}
-	hyConfig.Conn = wrapped
 	hyConfig.Cleanup = cleanup
+
 	return nil
 }
 
@@ -401,6 +480,9 @@ func parseServerRealmAddr(listen string) (*realm.Addr, bool, error) {
 }
 
 func (c *serverConfig) fillRealmConn(hyConfig *server.Config, addr *realm.Addr) error {
+	if c.Camouflage != nil {
+		return configError{Field: "camouflage", Err: errors.New("camouflage is not supported in realm mode")}
+	}
 	logger.Debug("realm server mode detected",
 		zap.String("realm", addr.RealmID),
 		zap.String("realmServer", addr.HostPort),
@@ -467,6 +549,133 @@ func (c *serverConfig) wrapObfs(conn net.PacketConn) (net.PacketConn, error) {
 	default:
 		return nil, configError{Field: "obfs.type", Err: errors.New("unsupported obfuscation type")}
 	}
+}
+
+// camouflageSecrets returns the labeled PSKs the filter verifies DCIDs against.
+//
+// Explicit camouflage.secrets win. Left empty they are derived from the
+// configured credentials instead, which is what lets a fleet of interchangeable
+// servers be described by one shared secret rather than two.
+//
+// Only the auth types that keep their credentials in the config can do that.
+// "http" and "command" delegate to something the server cannot enumerate, and
+// the Authenticator interface only verifies a credential it is handed -- there
+// is nothing to read out. Consulting them per packet is not an alternative
+// either: that would fire an HTTP request or fork a process for every
+// unauthenticated datagram, pointed at the operator's own auth backend.
+func (c *serverConfig) camouflageSecrets() (map[string][]byte, error) {
+	if len(c.Camouflage.Secrets) > 0 {
+		secrets := make(map[string][]byte, len(c.Camouflage.Secrets))
+		for label, b64 := range c.Camouflage.Secrets {
+			psk, err := base64.StdEncoding.DecodeString(b64)
+			if err != nil {
+				return nil, configError{Field: "camouflage.secrets." + label, Err: err}
+			}
+			secrets[label] = psk
+		}
+		return secrets, nil
+	}
+	switch strings.ToLower(c.Auth.Type) {
+	case "password":
+		if c.Auth.Password == "" {
+			return nil, configError{Field: "camouflage.secrets", Err: errors.New("no secrets set and auth.password is empty")}
+		}
+		return map[string][]byte{"password": camo.DerivePSK(c.Auth.Password)}, nil
+	case "userpass":
+		if len(c.Auth.UserPass) == 0 {
+			return nil, configError{Field: "camouflage.secrets", Err: errors.New("no secrets set and auth.userpass is empty")}
+		}
+		// Labeled by username, so a camouflage alert names the account whose
+		// credential was used rather than a hand-written group.
+		secrets := make(map[string][]byte, len(c.Auth.UserPass))
+		for user, pass := range c.Auth.UserPass {
+			secrets[strings.ToLower(user)] = camo.DerivePSK(user + ":" + pass)
+		}
+		return secrets, nil
+	default:
+		return nil, configError{
+			Field: "camouflage.secrets",
+			Err:   fmt.Errorf("cannot be derived from auth type %q, set it explicitly", c.Auth.Type),
+		}
+	}
+}
+
+func (c *serverConfig) buildCamouflageFilter(conn net.PacketConn) (net.PacketConn, error) {
+	if c.Camouflage.Dest == "" {
+		return nil, configError{Field: "camouflage.dest", Err: errors.New("dest is required")}
+	}
+	secrets, err := c.camouflageSecrets()
+	if err != nil {
+		return nil, err
+	}
+
+	var serverIPs []net.IP
+	for _, addr := range c.Camouflage.ServerAddr {
+		addr = strings.TrimSpace(addr)
+		if addr == "" {
+			continue
+		}
+		ip := net.ParseIP(addr)
+		if ip == nil {
+			// Named rather than just "invalid": with a list, "one of these is
+			// wrong" is not a diagnosis.
+			return nil, configError{
+				Field: "camouflage.serverAddr",
+				Err:   fmt.Errorf("%q is not a valid IP address", addr),
+			}
+		}
+		serverIPs = append(serverIPs, ip)
+	}
+	if len(serverIPs) == 0 {
+		logger.Warn("camouflage: serverAddr not set, server_id check disabled")
+	}
+
+	rl := camo.NewRateLimiter(c.Camouflage.RateLimit.Threshold, c.Camouflage.RateLimit.Window)
+
+	udpRelay, err := camo.NewUDPRelay(c.Camouflage.Dest, conn)
+	if err != nil {
+		return nil, configError{Field: "camouflage.dest", Err: err}
+	}
+
+	// Worth a line of its own at startup. A client whose secret disagrees with
+	// the server's is relayed to dest exactly like a probe, so the failure has
+	// no server-side symptom at all -- without this the operator cannot even
+	// tell whether the filter is running, let alone which set of secrets it
+	// ended up with.
+	logger.Info("camouflage enabled",
+		zap.String("dest", c.Camouflage.Dest),
+		zap.Int("secrets", len(secrets)),
+		zap.Bool("derivedFromAuth", len(c.Camouflage.Secrets) == 0),
+		zap.Strings("serverAddr", c.Camouflage.ServerAddr))
+
+	return camo.WrapPacketConn(conn, camo.FilterConfig{
+		Secrets:     secrets,
+		ServerIPs:   serverIPs,
+		RateLimiter: rl,
+		UDPRelay:    udpRelay,
+		AlertFunc: func(src net.Addr, reason, label string) {
+			logger.Warn(
+				"camouflage alert",
+				zap.String("src", src.String()),
+				zap.String("reason", reason),
+				zap.String("label", label),
+				// The value the alert is usually about. Printing it turns
+				// "something is wrong" into a line the operator can compare
+				// against the address their clients actually dial.
+				zap.Strings("serverAddr", c.Camouflage.ServerAddr),
+			)
+		},
+		// Debug rather than info: one line per rejected packet is far too much
+		// for normal running, and the question it answers -- "is my client even
+		// reaching this server, and what did the filter make of it" -- is one an
+		// operator asks while already looking.
+		RelayFunc: func(src net.Addr, reason string) {
+			logger.Debug("camouflage relayed to dest",
+				zap.String("src", src.String()),
+				zap.String("reason", reason),
+				zap.String("dest", c.Camouflage.Dest))
+		},
+	}), nil
 }
 
 func resolveServerListenAddr(listenAddr string) (*net.UDPAddr, eUtils.PortUnion, error) {

@@ -1,0 +1,154 @@
+package camouflage
+
+import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"net"
+	"time"
+
+	quic "github.com/apernet/quic-go"
+)
+
+const (
+	// The wire-visible half of the token's disguise. quic-go otherwise picks an
+	// initial DCID length at random between 8 and 20, which no browser does, so
+	// the length alone separates it from ordinary traffic on the first packet.
+	// Taking Chrome's value from quic-go rather than repeating the number keeps
+	// the two from drifting apart -- a drift nothing would report, because a
+	// mismatched length still connects perfectly well and only the disguise is
+	// lost.
+	DCIDLen           = quic.ChromeConnectionIDLenInitial
+	nonceLen          = 3
+	serverIDLen       = 1
+	hmacTagLen        = 4
+	DefaultTimeBucket = 120 * time.Second
+)
+
+// GenerateDCID generates an 8-byte Destination Connection ID for the client.
+// Layout: nonce (3B) || server_id (1B) || HMAC-SHA256 tag (4B truncated).
+func GenerateDCID(psk []byte, serverIP net.IP, timeBucketSize time.Duration) ([]byte, error) {
+	if timeBucketSize == 0 {
+		timeBucketSize = DefaultTimeBucket
+	}
+	nonce := make([]byte, nonceLen)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	serverID := ComputeServerID(psk, serverIP)
+	bucket := currentTimeBucket(timeBucketSize)
+
+	tag := computeHMACTag(psk, nonce, bucket, serverID)
+
+	dcid := make([]byte, DCIDLen)
+	copy(dcid[0:nonceLen], nonce)
+	dcid[nonceLen] = serverID
+	copy(dcid[nonceLen+serverIDLen:], tag[:hmacTagLen])
+	return dcid, nil
+}
+
+// VerifyResult holds the result of a DCID verification attempt.
+type VerifyResult struct {
+	// Label is the matched secret's label, empty if no secret matched.
+	Label string
+	// ServerIDMatch is true when the server_id embedded in the DCID matches
+	// the expected value for this server. Always true when myIP is nil.
+	ServerIDMatch bool
+}
+
+// Matched returns true when at least one secret produced a valid HMAC.
+func (r VerifyResult) Matched() bool { return r.Label != "" }
+
+// VerifyDCID checks a DCID against all labeled secrets.
+// Returns immediately with empty result if len(dcid) != DCIDLen.
+// Iterates all secrets x 2 time buckets (current and previous).
+// When myIP is nil, server_id comparison is skipped (ServerIDMatch = true).
+func VerifyDCID(secrets map[string][]byte, myIP net.IP, dcid []byte, timeBucketSize time.Duration) VerifyResult {
+	if myIP == nil {
+		return VerifyDCIDAny(secrets, nil, dcid, timeBucketSize)
+	}
+	return VerifyDCIDAny(secrets, []net.IP{myIP}, dcid, timeBucketSize)
+}
+
+// VerifyDCIDAny is VerifyDCID against every address this server answers at.
+//
+// The plural is the whole point. server_id is a function of one address, while
+// a server bound to the wildcard holds as many as the host does, and a client
+// necessarily mints its token against the one it dialled. Checking against a
+// single address therefore rejects every client that arrived on any of the
+// others -- and rejection here means being handed to the decoy, so those
+// clients fail with a timeout and no server-side error at all.
+//
+// A token is accepted when it matches ANY of the addresses, because they are
+// all this same server: server_id exists to stop a token minted for one server
+// being replayed to another, and a second address on the same host is not
+// another server. Cross-server replay is still caught, since the replaying
+// server holds none of the originator's addresses.
+//
+// An empty myIPs skips the comparison entirely (ServerIDMatch = true), which is
+// what an operator who has not named any address gets. nil entries are ignored
+// so a caller need not filter what it collected.
+func VerifyDCIDAny(secrets map[string][]byte, myIPs []net.IP, dcid []byte, timeBucketSize time.Duration) VerifyResult {
+	if len(dcid) != DCIDLen {
+		return VerifyResult{}
+	}
+	if timeBucketSize == 0 {
+		timeBucketSize = DefaultTimeBucket
+	}
+
+	nonce := dcid[0:nonceLen]
+	serverID := dcid[nonceLen]
+	tag := dcid[nonceLen+serverIDLen : DCIDLen]
+
+	cur := currentTimeBucket(timeBucketSize)
+	buckets := [2]uint64{cur, cur - 1}
+
+	for label, psk := range secrets {
+		for _, bucket := range buckets {
+			expected := computeHMACTag(psk, nonce, bucket, serverID)
+			if hmac.Equal(tag, expected[:hmacTagLen]) {
+				return VerifyResult{Label: label, ServerIDMatch: serverIDMatches(psk, myIPs, serverID)}
+			}
+		}
+	}
+	return VerifyResult{}
+}
+
+// serverIDMatches reports whether serverID names any of myIPs under psk.
+// Vacuously true when no usable address was supplied -- see VerifyDCIDAny.
+func serverIDMatches(psk []byte, myIPs []net.IP, serverID byte) bool {
+	checked := false
+	for _, ip := range myIPs {
+		if ip == nil {
+			continue
+		}
+		checked = true
+		if serverID == ComputeServerID(psk, ip) {
+			return true
+		}
+	}
+	return !checked
+}
+
+// ComputeServerID derives a 1-byte server identifier from PSK and IP.
+func ComputeServerID(psk []byte, ip net.IP) byte {
+	mac := hmac.New(sha256.New, psk)
+	mac.Write([]byte("server_id"))
+	mac.Write(ip.To16())
+	return mac.Sum(nil)[0]
+}
+
+func computeHMACTag(psk, nonce []byte, timeBucket uint64, serverID byte) []byte {
+	mac := hmac.New(sha256.New, psk)
+	mac.Write(nonce)
+	var tb [8]byte
+	binary.BigEndian.PutUint64(tb[:], timeBucket)
+	mac.Write(tb[:])
+	mac.Write([]byte{serverID})
+	return mac.Sum(nil)[:hmacTagLen]
+}
+
+func currentTimeBucket(size time.Duration) uint64 {
+	return uint64(time.Now().Unix()) / uint64(size.Seconds())
+}

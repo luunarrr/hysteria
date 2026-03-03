@@ -122,6 +122,7 @@ type QUICConfig struct {
 	DisablePathMTUDiscovery        bool // The server may still override this to true on unsupported platforms.
 	DisableGSO                     bool
 	DisableChromeParrot            bool // Chrome QUIC fingerprint parroting is on by default.
+	InitialDestConnectionID        []byte
 }
 
 type CongestionConfig struct {

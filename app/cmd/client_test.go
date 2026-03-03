@@ -7,17 +7,21 @@ import (
 	"time"
 
 	"github.com/apernet/hysteria/core/v2/client"
+	camo "github.com/apernet/hysteria/extras/v2/camouflage"
+	"github.com/apernet/hysteria/extras/v2/transport/udphop"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/spf13/viper"
 )
 
 // TestClientConfig tests the parsing of the client config
-// Addressable so the pointer fields in the expected pppSSTPConfig can refer to
-// them; a composite literal cannot take the address of a constant.
+// Addressable so the pointer fields in the expected pppSSTPConfig and
+// clientConfigCamouflage can refer to them; a composite literal cannot take the
+// address of a constant.
 var (
 	testPPPMSSClamp    = 1360
 	testPPPServerRoute = true
+	testCamouflageOn   = true
 )
 
 func TestClientConfig(t *testing.T) {
@@ -63,13 +67,14 @@ func TestClientConfig(t *testing.T) {
 			},
 		},
 		TLS: clientConfigTLS{
-			SNI:               "another.example.com",
-			Insecure:          true,
-			PinSHA256:         "114515DEADBEEF",
-			CA:                "custom_ca.crt",
-			ClientCertificate: "client.crt",
-			ClientKey:         "client.key",
-			ECH:               "AEv+DQBHAAAgACB3rc0Q",
+			SNI:                "another.example.com",
+			Insecure:           true,
+			PinSHA256:          "114515DEADBEEF",
+			SkipHostnameVerify: true,
+			CA:                 "custom_ca.crt",
+			ClientCertificate:  "client.crt",
+			ClientKey:          "client.key",
+			ECH:                "AEv+DQBHAAAgACB3rc0Q",
 		},
 		QUIC: clientConfigQUIC{
 			InitStreamReceiveWindow:     1145141,
@@ -138,6 +143,11 @@ func TestClientConfig(t *testing.T) {
 		},
 		TCPRedirect: &tcpRedirectConfig{
 			Listen: "127.0.0.1:3500",
+		},
+		Camouflage: &clientConfigCamouflage{
+			Enabled:  &testCamouflageOn,
+			Secret:   "c2VjcmV0LWtleS0zMi1ieXRlcy1sb25nLXBhZA==",
+			ServerIP: "203.0.113.7",
 		},
 		PPP: &pppConfig{
 			Mode:        "sstp",
@@ -417,4 +427,145 @@ func stringRef(s string) *string {
 
 func uint32Ref(i uint32) *uint32 {
 	return &i
+}
+
+// TestClientFillCamouflage covers deriving the client PSK from the auth string
+// it is already configured with, and the end-to-end agreement with what a
+// server derives for the same account.
+func TestClientFillCamouflage(t *testing.T) {
+	const serverIP = "203.0.113.7"
+	udpAddr := func(ip string) net.Addr { return &net.UDPAddr{IP: net.ParseIP(ip), Port: 443} }
+	enabled := true
+	disabled := false
+
+	fill := func(t *testing.T, config clientConfig, addr net.Addr) (*client.Config, error) {
+		t.Helper()
+		hyConfig := &client.Config{ServerAddr: addr}
+		return hyConfig, config.fillCamouflage(hyConfig)
+	}
+
+	t.Run("absent block is a no-op", func(t *testing.T) {
+		hyConfig, err := fill(t, clientConfig{Auth: "bear:hunter2"}, udpAddr(serverIP))
+		assert.NoError(t, err)
+		assert.Nil(t, hyConfig.QUICConfig.InitialDestConnectionID)
+	})
+
+	t.Run("enabled false is a no-op", func(t *testing.T) {
+		hyConfig, err := fill(t, clientConfig{
+			Auth:       "bear:hunter2",
+			Camouflage: &clientConfigCamouflage{Enabled: &disabled, ServerIP: serverIP},
+		}, udpAddr(serverIP))
+		assert.NoError(t, err)
+		assert.Nil(t, hyConfig.QUICConfig.InitialDestConnectionID)
+	})
+
+	// The property multilink depends on: nothing in the config names a
+	// concentrator, so one shared configuration produces a different, correct
+	// token per link purely from the address that link dials.
+	t.Run("address derived per link", func(t *testing.T) {
+		shared := clientConfig{
+			Auth:       "bear:hunter2",
+			Camouflage: &clientConfigCamouflage{Enabled: &enabled},
+		}
+		secrets := map[string][]byte{"bear": camo.DerivePSK("bear:hunter2")}
+
+		for _, ip := range []string{"203.0.113.7", "198.51.100.9"} {
+			hyConfig, err := fill(t, shared, udpAddr(ip))
+			assert.NoError(t, err)
+			dcid := hyConfig.QUICConfig.InitialDestConnectionID
+
+			res := camo.VerifyDCID(secrets, net.ParseIP(ip), dcid, 0)
+			assert.True(t, res.Matched(), "own concentrator must accept: %s", ip)
+			assert.True(t, res.ServerIDMatch, "own concentrator must match server_id: %s", ip)
+			assert.Equal(t, "bear", res.Label)
+
+			// And the same token must not pass as another concentrator's, which
+			// is the cross-server replay protection the address exists for.
+			other := camo.VerifyDCID(secrets, net.ParseIP("192.0.2.1"), dcid, 0)
+			assert.True(t, other.Matched())
+			assert.False(t, other.ServerIDMatch, "token must not match a different concentrator")
+		}
+	})
+
+	t.Run("port hopping address derives too", func(t *testing.T) {
+		hopAddr := &udphop.UDPHopAddr{IP: net.ParseIP(serverIP), Ports: []uint16{443}, PortStr: "443"}
+		hyConfig, err := fill(t, clientConfig{
+			Auth:       "bear:hunter2",
+			Camouflage: &clientConfigCamouflage{Enabled: &enabled},
+		}, hopAddr)
+		assert.NoError(t, err)
+		res := camo.VerifyDCID(map[string][]byte{"bear": camo.DerivePSK("bear:hunter2")},
+			net.ParseIP(serverIP), hyConfig.QUICConfig.InitialDestConnectionID, 0)
+		assert.True(t, res.Matched())
+		assert.True(t, res.ServerIDMatch)
+	})
+
+	t.Run("explicit serverIP overrides the dialed address", func(t *testing.T) {
+		hyConfig, err := fill(t, clientConfig{
+			Auth:       "bear:hunter2",
+			Camouflage: &clientConfigCamouflage{Enabled: &enabled, ServerIP: "192.0.2.1"},
+		}, udpAddr(serverIP))
+		assert.NoError(t, err)
+		secrets := map[string][]byte{"bear": camo.DerivePSK("bear:hunter2")}
+		dcid := hyConfig.QUICConfig.InitialDestConnectionID
+		assert.True(t, camo.VerifyDCID(secrets, net.ParseIP("192.0.2.1"), dcid, 0).ServerIDMatch)
+		assert.False(t, camo.VerifyDCID(secrets, net.ParseIP(serverIP), dcid, 0).ServerIDMatch)
+	})
+
+	t.Run("invalid explicit serverIP is rejected", func(t *testing.T) {
+		_, err := fill(t, clientConfig{
+			Auth:       "bear:hunter2",
+			Camouflage: &clientConfigCamouflage{Enabled: &enabled, ServerIP: "not-an-ip"},
+		}, udpAddr(serverIP))
+		assert.ErrorContains(t, err, "camouflage.serverIP")
+	})
+
+	t.Run("underivable address asks for an explicit one", func(t *testing.T) {
+		_, err := fill(t, clientConfig{
+			Server:     "somewhere:443",
+			Auth:       "bear:hunter2",
+			Camouflage: &clientConfigCamouflage{Enabled: &enabled},
+		}, nil)
+		assert.ErrorContains(t, err, "cannot be derived from server address")
+	})
+
+	t.Run("explicit secret wins over derivation", func(t *testing.T) {
+		hyConfig, err := fill(t, clientConfig{
+			Auth: "bear:hunter2",
+			Camouflage: &clientConfigCamouflage{
+				Enabled: &enabled,
+				Secret:  "c2VjcmV0LWtleS0zMi1ieXRlcy1sb25nLXBhZA==",
+			},
+		}, udpAddr(serverIP))
+		assert.NoError(t, err)
+		derived := map[string][]byte{"bear": camo.DerivePSK("bear:hunter2")}
+		assert.False(t, camo.VerifyDCID(derived, net.ParseIP(serverIP),
+			hyConfig.QUICConfig.InitialDestConnectionID, 0).Matched())
+	})
+
+	t.Run("invalid secret is rejected", func(t *testing.T) {
+		_, err := fill(t, clientConfig{
+			Camouflage: &clientConfigCamouflage{Enabled: &enabled, Secret: "not!base64"},
+		}, udpAddr(serverIP))
+		assert.ErrorContains(t, err, "camouflage.secret")
+	})
+
+	t.Run("empty auth leaves nothing to derive from", func(t *testing.T) {
+		_, err := fill(t, clientConfig{
+			Camouflage: &clientConfigCamouflage{Enabled: &enabled},
+		}, udpAddr(serverIP))
+		assert.ErrorContains(t, err, "camouflage.secret")
+	})
+
+	t.Run("password auth agrees end to end", func(t *testing.T) {
+		hyConfig, err := fill(t, clientConfig{
+			Auth:       "hunter2",
+			Camouflage: &clientConfigCamouflage{Enabled: &enabled},
+		}, udpAddr(serverIP))
+		assert.NoError(t, err)
+		res := camo.VerifyDCID(map[string][]byte{"password": camo.DerivePSK("hunter2")},
+			net.ParseIP(serverIP), hyConfig.QUICConfig.InitialDestConnectionID, 0)
+		assert.True(t, res.Matched())
+		assert.Equal(t, "password", res.Label)
+	})
 }
