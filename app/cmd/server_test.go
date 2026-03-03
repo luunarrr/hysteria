@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/apernet/hysteria/core/v2/server"
+	camo "github.com/apernet/hysteria/extras/v2/camouflage"
 	"github.com/apernet/hysteria/extras/v2/realm"
 	eUtils "github.com/apernet/hysteria/extras/v2/utils"
 	"github.com/stretchr/testify/assert"
@@ -203,6 +204,15 @@ func TestServerConfig(t *testing.T) {
 			Listen: ":9999",
 			Secret: "its_me_mario",
 		},
+		Camouflage: &serverConfigCamouflage{
+			Dest:       "www.bing.com:443",
+			Secrets:    map[string]string{"fleet": "c2VjcmV0LWtleS0zMi1ieXRlcy1sb25nLXBhZA=="},
+			ServerAddr: []string{"203.0.113.7"},
+			RateLimit: serverConfigCamouflageRateLimit{
+				Threshold: 100,
+				Window:    5 * time.Minute,
+			},
+		},
 		Masquerade: serverConfigMasquerade{
 			Type: "proxy",
 			File: serverConfigMasqueradeFile{
@@ -353,4 +363,95 @@ func TestRealmConnectAddrsCacheHit(t *testing.T) {
 	// Mutating the returned slice must not affect the cached one.
 	got[0] = netip.MustParseAddrPort("198.51.100.1:1")
 	assert.Equal(t, want, rt.addrs)
+}
+
+// TestServerCamouflageSecrets covers deriving the camouflage PSKs from the
+// configured credentials, so a deployment distributes one secret and not two.
+func TestServerCamouflageSecrets(t *testing.T) {
+	t.Run("explicit secrets win over derivation", func(t *testing.T) {
+		config := serverConfig{
+			Auth: serverConfigAuth{Type: "password", Password: "hunter2"},
+			Camouflage: &serverConfigCamouflage{
+				Secrets: map[string]string{"fleet": "c2VjcmV0LWtleS0zMi1ieXRlcy1sb25nLXBhZA=="},
+			},
+		}
+		secrets, err := config.camouflageSecrets()
+		assert.NoError(t, err)
+		assert.Len(t, secrets, 1)
+		assert.NotEqual(t, camo.DerivePSK("hunter2"), secrets["fleet"])
+	})
+
+	t.Run("invalid base64 is rejected", func(t *testing.T) {
+		config := serverConfig{
+			Camouflage: &serverConfigCamouflage{Secrets: map[string]string{"fleet": "not!base64"}},
+		}
+		_, err := config.camouflageSecrets()
+		assert.ErrorContains(t, err, "camouflage.secrets.fleet")
+	})
+
+	t.Run("derived from password auth", func(t *testing.T) {
+		config := serverConfig{
+			Auth:       serverConfigAuth{Type: "password", Password: "hunter2"},
+			Camouflage: &serverConfigCamouflage{},
+		}
+		secrets, err := config.camouflageSecrets()
+		assert.NoError(t, err)
+		assert.Equal(t, map[string][]byte{"password": camo.DerivePSK("hunter2")}, secrets)
+	})
+
+	t.Run("derived from userpass auth, labeled by account", func(t *testing.T) {
+		config := serverConfig{
+			Auth: serverConfigAuth{
+				Type:     "userpass",
+				UserPass: map[string]string{"bear": "hunter2", "zyp": "hunter3"},
+			},
+			Camouflage: &serverConfigCamouflage{},
+		}
+		secrets, err := config.camouflageSecrets()
+		assert.NoError(t, err)
+		assert.Equal(t, map[string][]byte{
+			"bear": camo.DerivePSK("bear:hunter2"),
+			"zyp":  camo.DerivePSK("zyp:hunter3"),
+		}, secrets)
+	})
+
+	t.Run("username case folded to match the authenticator", func(t *testing.T) {
+		config := serverConfig{
+			Auth: serverConfigAuth{
+				Type:     "userpass",
+				UserPass: map[string]string{"Bear": "hunter2"},
+			},
+			Camouflage: &serverConfigCamouflage{},
+		}
+		secrets, err := config.camouflageSecrets()
+		assert.NoError(t, err)
+		// What a client configured as either "Bear:hunter2" or "bear:hunter2"
+		// derives, since UserPassAuthenticator accepts both.
+		assert.Equal(t, camo.DerivePSK("bear:hunter2"), secrets["bear"])
+	})
+
+	t.Run("empty credentials are rejected", func(t *testing.T) {
+		for _, auth := range []serverConfigAuth{
+			{Type: "password"},
+			{Type: "userpass"},
+		} {
+			config := serverConfig{Auth: auth, Camouflage: &serverConfigCamouflage{}}
+			_, err := config.camouflageSecrets()
+			assert.ErrorContains(t, err, "camouflage.secrets", "auth type %q", auth.Type)
+		}
+	})
+
+	t.Run("undelegatable auth types must set secrets explicitly", func(t *testing.T) {
+		// http and command hold no credential the filter can read, and calling
+		// them per packet would point a request or a fork at the operator's own
+		// auth backend for every probe.
+		for _, authType := range []string{"http", "https", "command", "cmd", ""} {
+			config := serverConfig{
+				Auth:       serverConfigAuth{Type: authType},
+				Camouflage: &serverConfigCamouflage{},
+			}
+			_, err := config.camouflageSecrets()
+			assert.ErrorContains(t, err, "cannot be derived from auth type", "auth type %q", authType)
+		}
+	})
 }
