@@ -121,6 +121,7 @@ type QUICConfig struct {
 	KeepAlivePeriod                time.Duration
 	DisablePathMTUDiscovery        bool // The server may still override this to true on unsupported platforms.
 	DisableChromeParrot            bool // Chrome QUIC fingerprint parroting is on by default.
+	InitialDestConnectionID        []byte
 }
 
 type CongestionConfig struct {

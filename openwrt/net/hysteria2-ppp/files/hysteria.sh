@@ -110,7 +110,7 @@ hysteria_validate() {
 		;;
 	esac
 
-	if [ -n "$camouflage_secret" ]; then
+	if [ "$camouflage_enabled" = 1 ]; then
 		# The server refuses this pairing outright: camouflage recognises a flow
 		# by its QUIC header, and obfuscation is precisely what hides that
 		# header. The client does not check, so without this the link comes up
@@ -122,12 +122,17 @@ hysteria_validate() {
 			return 1
 			;;
 		esac
-		# The client requires both halves of the camouflage config; a secret on
-		# its own is a startup failure with nothing to point at.
-		[ -n "$camouflage_server_ip" ] || {
-			echo "CAMOUFLAGE_INCOMPLETE"
+		# A token is minted against the address of the concentrator it is for,
+		# and each link of a bundle crosses a different one. The client takes
+		# that address from whatever its own link dials, which is the only thing
+		# that differs between the links; overriding it here would mint every
+		# token against one concentrator, and the rest would relay their link to
+		# the decoy. That failure is silent on both ends, so refuse the pairing
+		# rather than let a bundle come up at one link's worth of capacity.
+		if [ -n "$camouflage_server_ip" ] && [ -n "$hysteria_extra_servers" ]; then
+			echo "CAMOUFLAGE_SERVER_IP_MULTILINK"
 			return 1
-		}
+		fi
 	fi
 
 	return 0
@@ -194,9 +199,14 @@ hysteria_write_config() {
 
 	[ "$fast_open" = 1 ] && echo "fastOpen: true" >> "$file"
 
-	if [ -n "$camouflage_secret" ]; then
+	# Both members are overrides, so the block is written from the flag alone and
+	# is usually just the flag: the secret comes from the Hysteria2 credential
+	# above, and the address from the "server" line at the top of this same file,
+	# which is the one thing that differs between the links of a bundle.
+	if [ "$camouflage_enabled" = 1 ]; then
 		echo "camouflage:" >> "$file"
-		echo "  secret: $(hysteria_yaml_quote "$camouflage_secret")" >> "$file"
+		echo "  enabled: true" >> "$file"
+		[ -n "$camouflage_secret" ] && echo "  secret: $(hysteria_yaml_quote "$camouflage_secret")" >> "$file"
 		[ -n "$camouflage_server_ip" ] && echo "  serverIP: $(hysteria_yaml_quote "$camouflage_server_ip")" >> "$file"
 	fi
 
@@ -251,6 +261,7 @@ proto_hysteria_init_config() {
 	proto_config_add_string "hop_interval"
 	proto_config_add_boolean "fast_open"
 	proto_config_add_int "data_streams"
+	proto_config_add_boolean "camouflage_enabled"
 	proto_config_add_string "camouflage_secret"
 	proto_config_add_string "camouflage_server_ip"
 	proto_config_add_string "config_file"
@@ -423,12 +434,12 @@ proto_hysteria_setup() {
 	local server auth sni insecure pin_sha256 ca obfs_type obfs_password
 	local obfs_gecko_min_size obfs_gecko_max_size
 	local bandwidth_up bandwidth_down hop_interval fast_open data_streams
-	local camouflage_secret camouflage_server_ip config_file
+	local camouflage_enabled camouflage_secret camouflage_server_ip config_file
 	local multilink endpoint bundle username password keepalive pppd_options
 	json_get_vars server auth sni insecure pin_sha256 ca obfs_type obfs_password \
 		obfs_gecko_min_size obfs_gecko_max_size \
 		bandwidth_up bandwidth_down hop_interval fast_open data_streams \
-		camouflage_secret camouflage_server_ip config_file \
+		camouflage_enabled camouflage_secret camouflage_server_ip config_file \
 		multilink endpoint bundle username password keepalive pppd_options
 
 	hysteria_extra_servers=""

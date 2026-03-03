@@ -39,6 +39,7 @@ import (
 	"github.com/apernet/hysteria/app/v2/internal/utils"
 	"github.com/apernet/hysteria/core/v2/server"
 	"github.com/apernet/hysteria/extras/v2/auth"
+	camo "github.com/apernet/hysteria/extras/v2/camouflage"
 	"github.com/apernet/hysteria/extras/v2/correctnet"
 	"github.com/apernet/hysteria/extras/v2/masq"
 	"github.com/apernet/hysteria/extras/v2/obfs"
@@ -85,6 +86,7 @@ type serverConfig struct {
 	TrafficStats          serverConfigTrafficStats    `mapstructure:"trafficStats"`
 	Masquerade            serverConfigMasquerade      `mapstructure:"masquerade"`
 	PPP                   pppServerConfig             `mapstructure:"ppp"`
+	Camouflage            *serverConfigCamouflage     `mapstructure:"camouflage"`
 }
 
 type pppServerConfig struct {
@@ -127,6 +129,19 @@ type pppLNSConfig struct {
 type pppRouteConfig struct {
 	ID    string `mapstructure:"id"`
 	Group string `mapstructure:"group"`
+}
+
+type serverConfigCamouflageRateLimit struct {
+	Threshold int           `mapstructure:"threshold"`
+	Window    time.Duration `mapstructure:"window"`
+}
+
+type serverConfigCamouflage struct {
+	Dest       string                          `mapstructure:"dest"`
+	Secrets    map[string]string               `mapstructure:"secrets"`
+	ListenTCP  string                          `mapstructure:"listenTCP"`
+	ServerAddr string                          `mapstructure:"serverAddr"`
+	RateLimit  serverConfigCamouflageRateLimit `mapstructure:"rateLimit"`
 }
 
 type serverConfigRealm struct {
@@ -370,16 +385,48 @@ func (c *serverConfig) fillConn(hyConfig *server.Config) error {
 			return configError{Field: "listen", Err: err}
 		}
 	}
-	wrapped, err := c.wrapObfs(packetConn)
-	if err != nil {
-		_ = conn.Close()
-		if cleanup != nil {
-			_ = cleanup.Close()
+	if c.Camouflage != nil {
+		if obfsType := strings.ToLower(c.Obfs.Type); obfsType != "" && obfsType != "plain" {
+			_ = conn.Close()
+			if cleanup != nil {
+				_ = cleanup.Close()
+			}
+			return configError{Field: "camouflage", Err: errors.New("camouflage cannot be combined with obfs, which hides the QUIC header the filter inspects")}
 		}
-		return err
+		filterConn, err := c.buildCamouflageFilter(packetConn)
+		if err != nil {
+			_ = conn.Close()
+			if cleanup != nil {
+				_ = cleanup.Close()
+			}
+			return err
+		}
+		hyConfig.Conn = filterConn
+	} else {
+		wrapped, err := c.wrapObfs(packetConn)
+		if err != nil {
+			_ = conn.Close()
+			if cleanup != nil {
+				_ = cleanup.Close()
+			}
+			return err
+		}
+		hyConfig.Conn = wrapped
 	}
-	hyConfig.Conn = wrapped
 	hyConfig.Cleanup = cleanup
+
+	if c.Camouflage != nil && c.Camouflage.ListenTCP != "" {
+		if c.Camouflage.Dest == "" {
+			return configError{Field: "camouflage.dest", Err: errors.New("dest is required when listenTCP is set")}
+		}
+		tcpRelay := camo.NewTCPRelay(c.Camouflage.ListenTCP, c.Camouflage.Dest)
+		go func() {
+			if err := tcpRelay.Serve(); err != nil {
+				logger.Error("camouflage TCP relay error", zap.Error(err))
+			}
+		}()
+	}
+
 	return nil
 }
 
@@ -395,6 +442,9 @@ func parseServerRealmAddr(listen string) (*realm.Addr, bool, error) {
 }
 
 func (c *serverConfig) fillRealmConn(hyConfig *server.Config, addr *realm.Addr) error {
+	if c.Camouflage != nil {
+		return configError{Field: "camouflage", Err: errors.New("camouflage is not supported in realm mode")}
+	}
 	logger.Debug("realm server mode detected",
 		zap.String("realm", addr.RealmID),
 		zap.String("realmServer", addr.HostPort),
@@ -461,6 +511,122 @@ func (c *serverConfig) wrapObfs(conn net.PacketConn) (net.PacketConn, error) {
 	default:
 		return nil, configError{Field: "obfs.type", Err: errors.New("unsupported obfuscation type")}
 	}
+}
+
+// camouflageSecrets returns the labeled PSKs the filter verifies DCIDs against.
+//
+// Explicit camouflage.secrets win. Left empty they are derived from the
+// configured credentials instead, which is what lets a fleet of interchangeable
+// servers be described by one shared secret rather than two.
+//
+// Only the auth types that keep their credentials in the config can do that.
+// "http" and "command" delegate to something the server cannot enumerate, and
+// the Authenticator interface only verifies a credential it is handed -- there
+// is nothing to read out. Consulting them per packet is not an alternative
+// either: that would fire an HTTP request or fork a process for every
+// unauthenticated datagram, pointed at the operator's own auth backend.
+func (c *serverConfig) camouflageSecrets() (map[string][]byte, error) {
+	if len(c.Camouflage.Secrets) > 0 {
+		secrets := make(map[string][]byte, len(c.Camouflage.Secrets))
+		for label, b64 := range c.Camouflage.Secrets {
+			psk, err := base64.StdEncoding.DecodeString(b64)
+			if err != nil {
+				return nil, configError{Field: "camouflage.secrets." + label, Err: err}
+			}
+			secrets[label] = psk
+		}
+		return secrets, nil
+	}
+	switch strings.ToLower(c.Auth.Type) {
+	case "password":
+		if c.Auth.Password == "" {
+			return nil, configError{Field: "camouflage.secrets", Err: errors.New("no secrets set and auth.password is empty")}
+		}
+		return map[string][]byte{"password": camo.DerivePSK(c.Auth.Password)}, nil
+	case "userpass":
+		if len(c.Auth.UserPass) == 0 {
+			return nil, configError{Field: "camouflage.secrets", Err: errors.New("no secrets set and auth.userpass is empty")}
+		}
+		// Labeled by username, so a camouflage alert names the account whose
+		// credential was used rather than a hand-written group.
+		secrets := make(map[string][]byte, len(c.Auth.UserPass))
+		for user, pass := range c.Auth.UserPass {
+			secrets[strings.ToLower(user)] = camo.DerivePSK(user + ":" + pass)
+		}
+		return secrets, nil
+	default:
+		return nil, configError{
+			Field: "camouflage.secrets",
+			Err:   fmt.Errorf("cannot be derived from auth type %q, set it explicitly", c.Auth.Type),
+		}
+	}
+}
+
+func (c *serverConfig) buildCamouflageFilter(conn net.PacketConn) (net.PacketConn, error) {
+	if c.Camouflage.Dest == "" {
+		return nil, configError{Field: "camouflage.dest", Err: errors.New("dest is required")}
+	}
+	secrets, err := c.camouflageSecrets()
+	if err != nil {
+		return nil, err
+	}
+
+	var serverIP net.IP
+	if c.Camouflage.ServerAddr != "" {
+		serverIP = net.ParseIP(c.Camouflage.ServerAddr)
+		if serverIP == nil {
+			return nil, configError{Field: "camouflage.serverAddr", Err: errors.New("invalid IP address")}
+		}
+	} else {
+		logger.Warn("camouflage: serverAddr not set, server_id check disabled")
+	}
+
+	rl := camo.NewRateLimiter(c.Camouflage.RateLimit.Threshold, c.Camouflage.RateLimit.Window)
+
+	udpRelay, err := camo.NewUDPRelay(c.Camouflage.Dest, conn)
+	if err != nil {
+		return nil, configError{Field: "camouflage.dest", Err: err}
+	}
+
+	// Worth a line of its own at startup. A client whose secret disagrees with
+	// the server's is relayed to dest exactly like a probe, so the failure has
+	// no server-side symptom at all -- without this the operator cannot even
+	// tell whether the filter is running, let alone which set of secrets it
+	// ended up with.
+	logger.Info("camouflage enabled",
+		zap.String("dest", c.Camouflage.Dest),
+		zap.Int("secrets", len(secrets)),
+		zap.Bool("derivedFromAuth", len(c.Camouflage.Secrets) == 0),
+		zap.String("serverAddr", c.Camouflage.ServerAddr))
+
+	return camo.WrapPacketConn(conn, camo.FilterConfig{
+		Secrets:     secrets,
+		ServerIP:    serverIP,
+		RateLimiter: rl,
+		UDPRelay:    udpRelay,
+		AlertFunc: func(src net.Addr, reason, label string) {
+			logger.Warn(
+				"camouflage alert",
+				zap.String("src", src.String()),
+				zap.String("reason", reason),
+				zap.String("label", label),
+				// The value the alert is usually about. Printing it turns
+				// "something is wrong" into a line the operator can compare
+				// against the address their clients actually dial.
+				zap.String("serverAddr", c.Camouflage.ServerAddr),
+			)
+		},
+		// Debug rather than info: one line per rejected packet is far too much
+		// for normal running, and the question it answers -- "is my client even
+		// reaching this server, and what did the filter make of it" -- is one an
+		// operator asks while already looking.
+		RelayFunc: func(src net.Addr, reason string) {
+			logger.Debug("camouflage relayed to dest",
+				zap.String("src", src.String()),
+				zap.String("reason", reason),
+				zap.String("dest", c.Camouflage.Dest))
+		},
+	}), nil
 }
 
 func resolveServerListenAddr(listenAddr string) (*net.UDPAddr, eUtils.PortUnion, error) {
