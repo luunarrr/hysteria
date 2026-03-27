@@ -1,0 +1,243 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ["app/v*.*.*"]
+
+permissions:
+  contents: write # the release job attaches assets
+  actions: write # the cleanup job deletes old runs
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      is_release: ${{ steps.info.outputs.is_release }}
+      version: ${{ steps.info.outputs.version }}
+      full_sha: ${{ steps.info.outputs.full_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # This fork carries only its own app/v* tags, so describe would otherwise
+      # measure master against whichever fork release came last and understate
+      # the base right after a rebase onto a newer upstream. Fetched rather than
+      # pushed into the fork: upstream has seventy of these, and every one of
+      # them matches this workflow's own tag trigger.
+      - name: Fetch upstream tags for the version base
+        run: |
+          git remote add upstream https://github.com/apernet/hysteria.git
+          git fetch --no-recurse-submodules --tags --quiet upstream || \
+            echo "::warning::could not fetch upstream tags; the version base may be stale"
+      - name: Compute build info
+        id: info
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/app/v* ]]; then
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+            echo "version=${GITHUB_REF#refs/tags/app/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            LATEST_TAG=$(git describe --tags --match 'app/v*' --abbrev=0 2>/dev/null || echo "app/v0.0.0")
+            echo "version=${LATEST_TAG#app/v}_git~${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "full_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+  # Upstream's own test workflow, folded in rather than reinvented. It carries
+  # the uv setup the Go tests need: several spawn a bare `python` helper and fail
+  # without one on PATH. Stress tests are skipped, as upstream skips them --
+  # they are volume, not correctness, and they time out on shared runners.
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install Python dependencies
+        run: uv sync
+        env:
+          UV_COMPILE_BYTECODE: "1"
+
+      - name: Activate Python environment
+        run: |
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+
+      - name: Install gofumpt
+        run: go install mvdan.cc/gofumpt@latest
+
+      - name: Check format
+        run: python hyperbole.py format-check
+
+      - name: Test core
+        working-directory: core
+        run: go test -count=1 -skip 'Stress' ./...
+
+      - name: Test extras
+        working-directory: extras
+        run: go test -count=1 ./...
+
+      - name: Test app
+        working-directory: app
+        run: go test -count=1 ./...
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64, name: linux-amd64 }
+          - { goos: linux, goarch: arm64, name: linux-arm64 }
+          - { goos: linux, goarch: arm, goarm: "7", name: linux-arm }
+          - { goos: linux, goarch: arm, goarm: "5", name: linux-armv5 }
+          - { goos: linux, goarch: mipsle, name: linux-mipsle }
+          - { goos: linux, goarch: mipsle, gomips: softfloat, name: linux-mipsle-sf }
+          - { goos: linux, goarch: mips, name: linux-mips }
+          - { goos: linux, goarch: mips, gomips: softfloat, name: linux-mips-sf }
+          - { goos: linux, goarch: "386", name: linux-386 }
+          - { goos: windows, goarch: amd64, name: windows-amd64, ext: .exe }
+          - { goos: windows, goarch: arm64, name: windows-arm64, ext: .exe }
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
+          CGO_ENABLED: "0"
+        run: |
+          PKG="github.com/apernet/hysteria/app/v2/cmd"
+          VERSION="${{ needs.prepare.outputs.version }}"
+          COMMIT=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          TOOLCHAIN=$(go env GOVERSION)
+          LIB_VERSION=$(grep 'github.com/apernet/quic-go' core/go.mod | head -1 | awk '{print $2}')
+
+          APP_TYPE="dev"
+          if [ "${{ needs.prepare.outputs.is_release }}" = "true" ]; then
+            APP_TYPE="release"
+          fi
+
+          LDFLAGS="-X ${PKG}.appVersion=${VERSION}"
+          LDFLAGS="${LDFLAGS} -X ${PKG}.appDate=${DATE}"
+          LDFLAGS="${LDFLAGS} -X ${PKG}.appType=${APP_TYPE}"
+          LDFLAGS="${LDFLAGS} -X ${PKG}.appToolchain=${TOOLCHAIN}"
+          LDFLAGS="${LDFLAGS} -X ${PKG}.appCommit=${COMMIT}"
+          LDFLAGS="${LDFLAGS} -X ${PKG}.appPlatform=${{ matrix.goos }}"
+          LDFLAGS="${LDFLAGS} -X ${PKG}.appArch=${{ matrix.goarch }}"
+          LDFLAGS="${LDFLAGS} -X ${PKG}.libVersion=${LIB_VERSION}"
+
+          BUILD_FLAGS=""
+          if [ "${{ needs.prepare.outputs.is_release }}" = "true" ]; then
+            LDFLAGS="-s -w ${LDFLAGS}"
+            BUILD_FLAGS="-trimpath"
+          fi
+
+          go build -o "hysteria-${{ matrix.name }}${{ matrix.ext }}" \
+            -ldflags "${LDFLAGS}" ${BUILD_FLAGS} ./app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hysteria-${{ matrix.name }}
+          path: hysteria-${{ matrix.name }}${{ matrix.ext }}
+          retention-days: ${{ needs.prepare.outputs.is_release == 'true' && 90 || 14 }}
+
+  release:
+    name: Release
+    needs: [prepare, test, build]
+    if: needs.prepare.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: hysteria-*
+          path: build/
+          merge-multiple: true
+
+      - name: Generate hashes
+        run: |
+          cd build
+          sha256sum hysteria-* > hashes.txt
+
+      # Binaries only. The router packages are built once, in
+      # luunarrr/openwrt-feed, where all three share the single index apk wants;
+      # building them here as well would be the same work for an artifact nobody
+      # installs from. This release is still what the feed resolves its release
+      # channel against, so cutting one remains how a release reaches a router.
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/*
+
+  # Packaging for a router happens in luunarrr/openwrt-feed and nowhere else:
+  # apk verifies one binary index per repository line, so the three packages a
+  # router needs have to be built together to share one. This only says that
+  # something moved -- the feed resolves for itself what to build, because master
+  # can move again while it is running.
+  dispatch-feed:
+    name: Rebuild the feed
+    needs: [prepare, test]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch
+        env:
+          # GITHUB_TOKEN is scoped to this repository and cannot dispatch to
+          # another one, so this is a PAT with contents:write on the feed. It is
+          # held in a repository variable rather than a secret, and variables are
+          # not masked -- so register it with the runner before it is used, or
+          # any later step that dumps its environment puts a live token in a
+          # public log.
+          GH_TOKEN: ${{ secrets.FEED_DISPATCH_TOKEN }}
+          EVENT: ${{ needs.prepare.outputs.is_release == 'true' && 'release' || 'master' }}
+          SOURCE: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::FEED_DISPATCH_TOKEN is not set, so the feed will not rebuild"
+            exit 0
+          fi
+          echo "::add-mask::$GH_TOKEN"
+          gh api "repos/luunarrr/openwrt-feed/dispatches" \
+            -f "event_type=$EVENT" \
+            -f "client_payload[source]=$SOURCE" \
+            -f "client_payload[sha]=$SHA"
+
+  cleanup:
+    name: Cleanup old runs
+    needs: prepare
+    if: needs.prepare.outputs.is_release == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 30
+          keep_minimum_runs: 5
