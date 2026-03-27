@@ -1,0 +1,259 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ["app/v*.*.*"]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  actions: write
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      is_release: ${{ steps.info.outputs.is_release }}
+      version: ${{ steps.info.outputs.version }}
+      full_sha: ${{ steps.info.outputs.full_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compute build info
+        id: info
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/app/v* ]]; then
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+            echo "version=${GITHUB_REF#refs/tags/app/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            LATEST_TAG=$(git describe --tags --match 'app/v*' --abbrev=0 2>/dev/null || echo "app/v0.0.0")
+            echo "version=${LATEST_TAG#app/v}_git~${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "full_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64, name: linux-amd64 }
+          - { goos: linux, goarch: arm64, name: linux-arm64 }
+          - { goos: linux, goarch: arm, goarm: "7", name: linux-arm }
+          - { goos: linux, goarch: arm, goarm: "5", name: linux-armv5 }
+          - { goos: linux, goarch: mipsle, name: linux-mipsle }
+          - { goos: linux, goarch: mipsle, gomips: softfloat, name: linux-mipsle-sf }
+          - { goos: linux, goarch: mips, name: linux-mips }
+          - { goos: linux, goarch: mips, gomips: softfloat, name: linux-mips-sf }
+          - { goos: linux, goarch: "386", name: linux-386 }
+          - { goos: windows, goarch: amd64, name: windows-amd64, ext: .exe }
+          - { goos: windows, goarch: arm64, name: windows-arm64, ext: .exe }
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
+          CGO_ENABLED: "0"
+        run: |
+          PKG="github.com/apernet/hysteria/app/v2/cmd"
+          VERSION="${{ needs.prepare.outputs.version }}"
+          COMMIT=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          TOOLCHAIN=$(go env GOVERSION)
+          LIB_VERSION=$(grep 'github.com/apernet/quic-go' core/go.mod | head -1 | awk '{print $2}')
+
+          APP_TYPE="dev"
+          if [ "${{ needs.prepare.outputs.is_release }}" = "true" ]; then
+            APP_TYPE="release"
+          fi
+
+          LDFLAGS="-X ${PKG}.appVersion=${VERSION}"
+          LDFLAGS="${LDFLAGS} -X ${PKG}.appDate=${DATE}"
+          LDFLAGS="${LDFLAGS} -X ${PKG}.appType=${APP_TYPE}"
+          LDFLAGS="${LDFLAGS} -X ${PKG}.appToolchain=${TOOLCHAIN}"
+          LDFLAGS="${LDFLAGS} -X ${PKG}.appCommit=${COMMIT}"
+          LDFLAGS="${LDFLAGS} -X ${PKG}.appPlatform=${{ matrix.goos }}"
+          LDFLAGS="${LDFLAGS} -X ${PKG}.appArch=${{ matrix.goarch }}"
+          LDFLAGS="${LDFLAGS} -X ${PKG}.libVersion=${LIB_VERSION}"
+
+          BUILD_FLAGS=""
+          if [ "${{ needs.prepare.outputs.is_release }}" = "true" ]; then
+            LDFLAGS="-s -w ${LDFLAGS}"
+            BUILD_FLAGS="-trimpath"
+          fi
+
+          go build -o "hysteria-${{ matrix.name }}${{ matrix.ext }}" \
+            -ldflags "${LDFLAGS}" ${BUILD_FLAGS} ./app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hysteria-${{ matrix.name }}
+          path: hysteria-${{ matrix.name }}${{ matrix.ext }}
+          retention-days: ${{ needs.prepare.outputs.is_release == 'true' && 90 || 14 }}
+
+  build-openwrt:
+    name: OpenWrt ${{ matrix.arch }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - aarch64_generic
+          - mipsel_24kc
+          - mips_24kc
+          - arm_cortex-a7
+          - x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare package Makefile
+        run: |
+          IS_RELEASE="${{ needs.prepare.outputs.is_release }}"
+          VERSION="${{ needs.prepare.outputs.version }}"
+          FULL_SHA="${{ needs.prepare.outputs.full_sha }}"
+          REPO="${{ github.repository }}"
+          MAKEFILE="openwrt/net/hysteria2-ppp/Makefile"
+
+          if [ "$IS_RELEASE" = "true" ]; then
+            SOURCE_URL="https://codeload.github.com/${REPO}/tar.gz/app/v${VERSION}?"
+            HASH=$(curl -sL "https://codeload.github.com/${REPO}/tar.gz/app/v${VERSION}" | sha256sum | cut -d' ' -f1)
+            BUILD_DIR_SUFFIX="app-v${VERSION}"
+          else
+            SOURCE_URL="https://codeload.github.com/${REPO}/tar.gz/${FULL_SHA}?"
+            HASH=$(curl -sL "https://codeload.github.com/${REPO}/tar.gz/${FULL_SHA}" | sha256sum | cut -d' ' -f1)
+            BUILD_DIR_SUFFIX="${FULL_SHA}"
+          fi
+
+          sed -i "s/PKG_VERSION:=.*/PKG_VERSION:=${VERSION}/" "$MAKEFILE"
+          sed -i "s|PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=${SOURCE_URL}|" "$MAKEFILE"
+          sed -i "s/PKG_HASH:=.*/PKG_HASH:=${HASH}/" "$MAKEFILE"
+          sed -i "s|PKG_BUILD_DIR:=.*|PKG_BUILD_DIR:=\$(BUILD_DIR)/hysteria-${BUILD_DIR_SUFFIX}|" "$MAKEFILE"
+
+      - name: Build
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: ${{ matrix.arch }}-SNAPSHOT
+          V: s
+          FEED_DIR: ${{ github.workspace }}/openwrt
+          FEEDNAME: hysteria
+          PACKAGES: hysteria2-ppp
+          INDEX: 1
+          NO_REFRESH_CHECK: 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-${{ matrix.arch }}
+          path: bin/packages/${{ matrix.arch }}/hysteria/
+          retention-days: ${{ needs.prepare.outputs.is_release == 'true' && 90 || 14 }}
+
+  release:
+    name: Release
+    needs: [prepare, build, build-openwrt]
+    if: needs.prepare.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: hysteria-*
+          path: build/
+          merge-multiple: true
+
+      - name: Download OpenWrt artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: openwrt-*
+          path: ipk/
+
+      - name: Generate hashes
+        run: |
+          cd build
+          sha256sum hysteria-* > hashes.txt
+
+      - name: Collect .ipk files
+        run: |
+          mkdir -p ipk-release
+          find ipk -name '*.ipk' -exec cp {} ipk-release/ \;
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/*
+            ipk-release/*.ipk
+
+  deploy-feed:
+    name: Deploy Feed
+    needs: [prepare, build-openwrt]
+    if: needs.prepare.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Download OpenWrt artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: openwrt-*
+          path: artifacts/
+
+      - name: Prepare feed directory
+        run: |
+          mkdir -p feed
+          for dir in artifacts/openwrt-*/; do
+            arch=$(basename "$dir" | sed 's/openwrt-//')
+            mkdir -p "feed/${arch}"
+            cp "$dir"* "feed/${arch}/"
+          done
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: feed/
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  cleanup:
+    name: Cleanup old runs
+    needs: prepare
+    if: needs.prepare.outputs.is_release == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 30
+          keep_minimum_runs: 5
